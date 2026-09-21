@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import time
@@ -16,13 +18,112 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from workers_projects_runtime import mcp_server, runtime_env
+from workers_projects_runtime.api import create_app
 from workers_projects_runtime.bootstrap import sign_bootstrap_source_path
 from workers_projects_runtime.mcp_server import create_mcp_server
+from workers_projects_runtime.models import CreateDelegationRequest
+from workers_projects_runtime.openclaw_runtime import StubRuntime
 from workers_projects_runtime.signed_links import resolve_signed_link_ref
 
 
 def _fake_runtime_for_profile(profile: str) -> str:
     return "openclaw" if profile.startswith("openclaw") else profile
+
+
+def _delegation_identity_assertion(identity: dict, secret: str) -> str:
+    canonical = json.dumps(
+        {
+            "call_identity_digest": str(identity.get("call_identity_digest") or ""),
+            "goal_digest": str(identity.get("goal_digest") or ""),
+            "idempotency_key": str(identity.get("idempotency_key") or ""),
+            "objective_ordinal": int(identity.get("objective_ordinal")),
+            "source_event_id": str(identity.get("source_event_id") or ""),
+            "version": int(identity.get("version")),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(
+        secret.encode("utf-8"),
+        b"viventium.delegation-identity.v1\0" + canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _scoped_delegation_identity_assertion(
+    identity: dict,
+    secret: str,
+    *,
+    tenant_id: str,
+    owner_id: str,
+) -> str:
+    canonical = json.dumps(
+        {
+            "identity": {
+                "call_identity_digest": str(identity.get("call_identity_digest") or ""),
+                "goal_digest": str(identity.get("goal_digest") or ""),
+                "idempotency_key": str(identity.get("idempotency_key") or ""),
+                "launch_payload_digest": str(identity.get("launch_payload_digest") or ""),
+                "objective_ordinal": int(identity.get("objective_ordinal")),
+                "source_event_id": str(identity.get("source_event_id") or ""),
+                "version": int(identity.get("version")),
+            },
+            "owner_id": owner_id,
+            "tenant_id": tenant_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(
+        secret.encode("utf-8"),
+        b"viventium.delegation-identity.v2\0" + canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _launch_payload_digest(payload: dict) -> str:
+    canonical = json.dumps(
+        {
+            "alias": str(payload.get("alias") or "").strip(),
+            "backend": str(payload.get("backend") or "").strip(),
+            "bootstrap_profile": str(
+                payload.get("bootstrap_profile") or payload.get("bootstrapProfile") or ""
+            ).strip(),
+            "connected_account_content_intent": bool(
+                payload.get("connected_account_content_intent", False)
+            ),
+            "effort": str(payload.get("effort") or "").strip(),
+            "execution_mode": str(
+                payload.get("execution_mode") or payload.get("executionMode") or ""
+            ).strip(),
+            "expose_diagnostics": bool(payload.get("expose_diagnostics", False)),
+            "goal": str(payload.get("goal") or "").strip(),
+            "instruction": str(payload.get("instruction") or "").strip(),
+            "owner_id": str(payload.get("owner_id") or "").strip(),
+            "profile": str(payload.get("profile") or "").strip(),
+            "project_id": str(payload.get("project_id") or "").strip(),
+            "require_callback": bool(payload.get("require_callback", False)),
+            "reuse_existing_workspace": bool(
+                payload.get("reuse_existing_workspace", False)
+            ),
+            "title": str(payload.get("title") or "").strip(),
+            "worker_name": str(
+                payload.get("worker_name") or payload.get("workerName") or ""
+            ).strip(),
+            "worker_role": str(
+                payload.get("worker_role") or payload.get("workerRole") or ""
+            ).strip(),
+            "workspace_root": str(
+                payload.get("workspace_root") or payload.get("workspaceRoot") or ""
+            ).strip(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _patch_host_runtime_requirements_ok(monkeypatch):
@@ -683,7 +784,7 @@ class RememberedDispatchApiClient(TrackingApiClient):
 
 class RetryableFailureApiClient(FakeApiClient):
     def __init__(self):
-        self.assigned: list[dict[str, str]] = []
+        self.assigned: list[dict[str, object]] = []
 
     def get_run(self, run_id: str):
         if run_id == "run_retryable_failed":
@@ -702,6 +803,7 @@ class RetryableFailureApiClient(FakeApiClient):
                 "failure_user_message": "The provider rate-limited the worker before it finished.",
                 "failure_recommended_recovery": "Use workspace_continue to resume the same workspace.",
                 "failure_diagnostic_summary": "response.failed: Too Many Requests",
+                "continuation_context_json": "{}",
             }
         return {
             "run_id": run_id,
@@ -711,6 +813,11 @@ class RetryableFailureApiClient(FakeApiClient):
             "state": "queued",
             "queued_at": "2026-05-25T10:05:00+00:00",
             "instruction": self.assigned[-1]["instruction"] if self.assigned else "",
+            "continuation_context_json": (
+                json.dumps(self.assigned[-1].get("continuation_context") or {})
+                if self.assigned
+                else "{}"
+            ),
             "output_text": "",
             "error_text": "",
         }
@@ -760,6 +867,8 @@ class RetryableFailureApiClient(FakeApiClient):
             "instruction": instruction,
             "effort": effort or "",
             "bootstrap_bundle": bootstrap_bundle,
+            "continuation_context": continuation_context,
+            "continuation_context_json": json.dumps(continuation_context or {}),
         }
 
 
@@ -2325,6 +2434,28 @@ def test_enterprise_view_steer_url_does_not_fall_back_to_unsigned(monkeypatch):
     assert url is None
 
 
+def test_mcp_never_mints_new_view_or_artifact_refs_for_terminated_worker(
+    tmp_path,
+    monkeypatch,
+):
+    link_ref_state = tmp_path / "link-refs.sqlite3"
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(link_ref_state))
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "public-safe-signed-link-secret")
+    monkeypatch.setenv("GLASSHIVE_OPERATOR_BASE_URL", "https://glasshive.example.test")
+    worker = {
+        "worker_id": "wrk_terminated",
+        "project_id": "prj_terminated",
+        "tenant_id": "local",
+        "owner_id": "owner-a",
+        "state": "terminated",
+    }
+
+    assert mcp_server._signed_view_steer_url(worker, worker["project_id"], "librechat") is None
+    assert mcp_server._signed_artifact_open_url(worker, "outputs/report.txt") is None
+    assert mcp_server._signed_artifact_download_url(worker, "outputs/report.txt") is None
+    assert not link_ref_state.exists()
+
+
 def test_enterprise_mcp_refuses_non_http_transport(monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
 
@@ -2407,6 +2538,9 @@ def test_worker_delegate_once_creates_resumes_and_runs_without_listing(monkeypat
             assert "gh_token=" in record["target_url"]
             assert payload["view_steer"]["include_in_response"] is True
             assert payload["view_steer"]["url"] == payload["view_steer_url"]
+            assert payload["view_steer"]["label"] == "View / Steer Host Page Title QA"
+            assert payload["view_steer"]["link_kind"] == "mission_control"
+            assert payload["view_steer"]["state"] == "nonterminal"
             assert payload["result_tools"]["status"] == "workspace_status"
             assert payload["result_tools"]["wait"] == "workspace_wait"
             assert payload["completion_wait_timeout_seconds"] == 45
@@ -2524,7 +2658,7 @@ def test_worker_delegate_once_blocks_missing_host_cli_before_api_calls(monkeypat
     assert api_client.calls == []
 
 
-def test_worker_delegate_once_recovers_default_host_dependency_to_docker(monkeypatch, tmp_path):
+def test_worker_delegate_once_defers_host_version_check_to_reserved_service(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
     fake_node.chmod(0o755)
@@ -2536,6 +2670,13 @@ def test_worker_delegate_once_recovers_default_host_dependency_to_docker(monkeyp
         json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
     )
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "host_runtime_requirement_issue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transport must not execute host CLI version checks")
+        ),
+    )
     api_client = TrackingApiClient()
     server = create_mcp_server(api_client=api_client)
 
@@ -2553,13 +2694,12 @@ def test_worker_delegate_once_recovers_default_host_dependency_to_docker(monkeyp
             )
             payload = _tool_json(delegated)
             assert payload["status"] == "dispatched"
-            assert payload["runtime_recovery"]["from_execution_mode"] == "host"
-            assert payload["runtime_recovery"]["to_execution_mode"] == "docker"
             assert payload["follow_up_context"]["run_id"] == "run_assign"
-            assert payload["execution_mode"] == "docker"
+            assert payload["execution_mode"] == "host"
+            assert "runtime_recovery" not in payload
 
     asyncio.run(scenario())
-    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "docker"
+    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "host"
     assert api_client.assign_run_payloads[-1]["worker_id"] == "wrk_resumed"
 
 
@@ -2593,7 +2733,7 @@ def test_workspace_launch_recovers_explicit_host_when_host_workers_disabled(monk
     assert api_client.assign_run_payloads[-1]["worker_id"] == "wrk_resumed"
 
 
-def test_worker_delegate_once_blocks_explicit_host_dependency_mismatch_before_api_calls(monkeypatch, tmp_path):
+def test_worker_delegate_once_defers_explicit_host_version_check_to_service(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
     fake_node.chmod(0o755)
@@ -2605,6 +2745,13 @@ def test_worker_delegate_once_blocks_explicit_host_dependency_mismatch_before_ap
         json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
     )
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "host_runtime_requirement_issue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transport must not execute host CLI version checks")
+        ),
+    )
     api_client = TrackingApiClient()
     server = create_mcp_server(api_client=api_client)
 
@@ -2621,16 +2768,14 @@ def test_worker_delegate_once_blocks_explicit_host_dependency_mismatch_before_ap
                 },
             )
             payload = _tool_json(delegated)
-            assert payload["status"] == "blocked"
-            assert payload["failure_class"] == "runtime_dependency_missing"
-            assert "Node.js" in payload["failure_user_message"]
-            assert "22.19.0" in payload["failure_user_message"]
+            assert payload["status"] == "dispatched"
 
     asyncio.run(scenario())
-    assert api_client.calls == []
+    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "host"
+    assert api_client.assign_run_payloads[-1]["worker_id"] == "wrk_resumed"
 
 
-def test_workspace_schedule_blocks_missing_host_dependency_before_api_calls(monkeypatch, tmp_path):
+def test_workspace_schedule_defers_host_version_check_to_reserved_service(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
     fake_node.chmod(0o755)
@@ -2642,6 +2787,13 @@ def test_workspace_schedule_blocks_missing_host_dependency_before_api_calls(monk
         json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
     )
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "host_runtime_requirement_issue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transport must not execute host CLI version checks")
+        ),
+    )
     api_client = TrackingApiClient()
     server = create_mcp_server(api_client=api_client)
 
@@ -2658,17 +2810,14 @@ def test_workspace_schedule_blocks_missing_host_dependency_before_api_calls(monk
                 },
             )
             payload = _tool_json(scheduled)
-            assert payload["status"] == "blocked"
-            assert payload["failure_class"] == "runtime_dependency_missing"
-            assert "Node.js" in payload["failure_user_message"]
-            assert "22.19.0" in payload["failure_user_message"]
+            assert payload["status"] == "scheduled"
 
     asyncio.run(scenario())
-    assert api_client.calls == []
-    assert api_client.schedule_run_payloads == []
+    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "host"
+    assert api_client.schedule_run_payloads[-1]["schedule_text"] == "in 20 minutes"
 
 
-def test_workspace_schedule_recovers_default_host_dependency_to_docker(monkeypatch, tmp_path):
+def test_workspace_schedule_default_host_does_not_run_transport_cli_check(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
     fake_node.chmod(0o755)
@@ -2680,6 +2829,13 @@ def test_workspace_schedule_recovers_default_host_dependency_to_docker(monkeypat
         json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
     )
     monkeypatch.setattr(mcp_server, "get_http_headers", lambda: {})
+    monkeypatch.setattr(
+        mcp_server,
+        "host_runtime_requirement_issue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transport must not execute host CLI version checks")
+        ),
+    )
     api_client = TrackingApiClient()
     server = create_mcp_server(api_client=api_client)
 
@@ -2697,15 +2853,15 @@ def test_workspace_schedule_recovers_default_host_dependency_to_docker(monkeypat
             )
             payload = _tool_json(scheduled)
             assert payload["status"] == "scheduled"
-            assert payload["execution_mode"] == "docker"
-            assert payload["runtime_recovery"]["to_execution_mode"] == "docker"
+            assert payload["execution_mode"] == "host"
+            assert "runtime_recovery" not in payload
 
     asyncio.run(scenario())
-    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "docker"
+    assert api_client.find_or_resume_payloads[-1]["execution_mode"] == "host"
     assert api_client.schedule_run_payloads[-1]["schedule_text"] == "in 20 minutes"
 
 
-def test_worker_schedule_blocks_missing_host_dependency_before_schedule(monkeypatch, tmp_path):
+def test_worker_schedule_defers_host_version_check_to_reserved_service(monkeypatch, tmp_path):
     fake_node = tmp_path / "node"
     fake_node.write_text("#!/usr/bin/env bash\necho 'v20.20.2'\n")
     fake_node.chmod(0o755)
@@ -2714,6 +2870,13 @@ def test_worker_schedule_blocks_missing_host_dependency_before_schedule(monkeypa
     monkeypatch.setenv(
         "GLASSHIVE_HOST_RUNTIME_REQUIREMENTS_JSON",
         json.dumps({"codex-cli": [{"binary": str(fake_node), "label": "Node.js", "min_version": "22.19.0"}]}),
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "host_runtime_requirement_issue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transport must not execute host CLI version checks")
+        ),
     )
 
     class HostWorkerApiClient(TrackingApiClient):
@@ -2736,12 +2899,11 @@ def test_worker_schedule_blocks_missing_host_dependency_before_schedule(monkeypa
                 },
             )
             payload = _tool_json(scheduled)
-            assert payload["status"] == "blocked"
-            assert payload["failure_class"] == "runtime_dependency_missing"
-            assert "Node.js" in payload["failure_user_message"]
+            assert payload["state"] == "pending"
+            assert payload["worker_id"] == "wrk_host"
 
     asyncio.run(scenario())
-    assert api_client.schedule_run_payloads == []
+    assert api_client.schedule_run_payloads[-1]["schedule_text"] == "in 20 minutes"
 
 
 def test_worker_schedule_and_workspace_schedule_are_glasshive_native(monkeypatch):
@@ -4001,6 +4163,7 @@ def test_uploaded_file_text_prefers_owner_scoped_binary_when_available(monkeypat
                     "execution_mode": "docker",
                     "uploaded_files": [
                         {
+                            "file_id": "f3e753c4-44d9-48b5-8e0b-934b7e5f2c4a",
                             "filename": "Synthetic Client Brief Source.pdf",
                             "text": "extracted text is not a substitute for the original PDF",
                         }
@@ -4140,6 +4303,32 @@ def test_upload_owner_id_with_path_separators_is_rejected(monkeypatch, tmp_path)
     assert entry is not None
     assert entry["path"] == "uploads/brief.pdf.metadata.json"
     assert "source_path" not in entry
+
+
+@pytest.mark.parametrize("enterprise_mode", [False, True])
+def test_virtual_upload_source_enforces_asserted_owner_in_every_mode(
+    monkeypatch,
+    tmp_path,
+    enterprise_mode,
+):
+    uploads_root = tmp_path / "uploads"
+    own_upload = uploads_root / "owner-a" / "brief.txt"
+    other_upload = uploads_root / "owner-b" / "brief.txt"
+    own_upload.parent.mkdir(parents=True)
+    other_upload.parent.mkdir(parents=True)
+    own_upload.write_text("owner a")
+    other_upload.write_text("owner b")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true" if enterprise_mode else "false")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+
+    assert mcp_server._trusted_virtual_upload_source(
+        "/uploads/owner-a/brief.txt",
+        owner_id="owner-a",
+    ) == str(own_upload)
+    assert mcp_server._trusted_virtual_upload_source(
+        "/uploads/owner-b/brief.txt",
+        owner_id="owner-a",
+    ) == ""
 
 
 def test_worker_tools_use_configured_default_execution_mode(monkeypatch):
@@ -5984,6 +6173,155 @@ def test_worker_tools_default_owner_from_request_headers(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_worker_delegate_once_local_request_identity_overrides_forged_owner_and_project(
+    monkeypatch,
+):
+    class OwnerCheckingClient(FakeApiClient):
+        def __init__(self):
+            self.project_lookups: list[str] = []
+            self.created_owners: list[str | None] = []
+
+        def get_project(self, project_id: str):
+            self.project_lookups.append(project_id)
+            return {
+                "project_id": project_id,
+                "owner_id": "owner-b",
+                "title": "Sibling project",
+                "goal": "Must remain isolated",
+            }
+
+        def create_project(self, **kwargs):
+            self.created_owners.append(kwargs.get("owner_id"))
+            return super().create_project(**kwargs)
+
+    api = OwnerCheckingClient()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-local",
+            "X-Viventium-User-Id": "owner-a",
+        },
+    )
+    server = create_mcp_server(api_client=api)
+
+    async def scenario():
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="project is not available"):
+                await client.call_tool(
+                    "worker_delegate_once",
+                    {
+                        "title": "Scoped mission",
+                        "instruction": "Perform only the authenticated owner's work.",
+                        "owner_id": "owner-b",
+                        "project_id": "prj_owner_b",
+                        "profile": "codex-cli",
+                        "execution_mode": "docker",
+                    },
+                )
+
+    asyncio.run(scenario())
+    assert api.created_owners == []
+    assert api.project_lookups == ["prj_owner_b"]
+
+
+def test_local_mcp_legacy_tools_forward_trusted_owner_scope_to_the_api(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    monkeypatch.delenv("GLASSHIVE_ENTERPRISE_MODE", raising=False)
+    monkeypatch.delenv("WPR_ENTERPRISE_MODE", raising=False)
+    api_app = create_app(
+        db_path=str(tmp_path / "local-mcp-owner-scope.db"),
+        runtime_backend="stub",
+        runtime=StubRuntime(),
+        reconcile_on_startup=False,
+    )
+    api_http = TestClient(api_app)
+    owner_a_headers = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-local",
+        "X-Viventium-User-Id": "owner-a",
+    }
+    owner_b_headers = {
+        **owner_a_headers,
+        "X-Viventium-User-Id": "owner-b",
+    }
+    project_a = api_http.post(
+        "/v1/projects",
+        headers=owner_a_headers,
+        json={"owner_id": "forged", "title": "Owner A", "goal": "A only"},
+    ).json()
+    project_b = api_http.post(
+        "/v1/projects",
+        headers=owner_b_headers,
+        json={"owner_id": "forged", "title": "Owner B", "goal": "B only"},
+    ).json()
+
+    class InProcessHttpClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def request(self, method, url, json=None, headers=None):
+            parsed = urlsplit(url)
+            path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            return api_http.request(method, path, json=json, headers=headers)
+
+    monkeypatch.setattr(mcp_server.httpx, "Client", InProcessHttpClient)
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-local",
+            "X-Viventium-User-Id": "owner-a",
+        },
+    )
+    api = mcp_server.WorkersProjectsApiClient(
+        base_url="http://glasshive.in-process",
+        api_token="service-token",
+    )
+    server = create_mcp_server(api_client=api)
+    created_projects: list[dict] = []
+
+    async def scenario():
+        async with Client(server) as mcp_client:
+            listed = _tool_json(
+                await mcp_client.call_tool("projects_list", {"owner_id": "owner-b"})
+            )
+            assert listed in ([], {"result": []})
+            with pytest.raises(ToolError):
+                await mcp_client.call_tool(
+                    "project_get", {"project_id": project_b["project_id"]}
+                )
+            created = _tool_json(
+                await mcp_client.call_tool(
+                    "project_create",
+                    {
+                        "owner_id": "owner-b",
+                        "title": "Forged owner project",
+                        "goal": "Must remain with the trusted owner",
+                    },
+                )
+            )
+            assert created["owner_id"] == "owner-a"
+            created_projects.append(created)
+
+    asyncio.run(scenario())
+    assert {item["project_id"] for item in api.list_projects()} == {
+        project_a["project_id"],
+        created_projects[0]["project_id"],
+    }
+    with pytest.raises(mcp_server.GlassHiveApiError):
+        api.get_project(project_b["project_id"])
+
+
 def test_merge_request_context_adds_callback_metadata(monkeypatch):
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_URL", "http://localhost:3080/api/viventium/glasshive/callback")
     monkeypatch.setenv("VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "callback-secret")
@@ -6004,6 +6342,8 @@ def test_merge_request_context_adds_callback_metadata(monkeypatch):
             "X-Viventium-Telegram-Chat-Id": "chat-123",
             "X-Viventium-Telegram-User-Id": "tg-user-123",
             "X-Viventium-Telegram-Message-Id": "tg-msg-123",
+            "X-Viventium-Logical-Turn-Id": "turn-123",
+            "X-Viventium-Logical-Turn-Revision": "2",
         },
     )
 
@@ -6019,6 +6359,8 @@ def test_merge_request_context_adds_callback_metadata(monkeypatch):
     assert callbacks["stream_id"] == "stream-123"
     assert callbacks["voice_call_session_id"] == "call-123"
     assert callbacks["telegram_chat_id"] == "chat-123"
+    assert callbacks["logical_turn_id"] == "turn-123"
+    assert callbacks["logical_turn_revision"] == "2"
     assert bundle["viventium_context"]["user_id"] == "user-123"
 
 
@@ -6104,7 +6446,7 @@ def test_merge_request_context_projects_uploaded_file_headers(monkeypatch):
     assert "source_path" not in bundle["files"][0]
     manifest = json.loads(bundle["files"][0]["content"])
     assert manifest["file_id"] == "file-123"
-    assert manifest["source_ref"] == "/uploads/user/brief.txt"
+    assert "source_ref" not in manifest
 
 
 def test_merge_request_context_accepts_generic_glasshive_headers(monkeypatch):
@@ -6185,6 +6527,58 @@ def test_merge_request_context_maps_virtual_uploads_to_trusted_local_source(monk
     )
 
 
+def test_merge_request_context_preserves_ordered_media_group_metadata(monkeypatch, tmp_path):
+    uploads_root = tmp_path / "uploads"
+    owner_root = uploads_root / "user-123"
+    owner_root.mkdir(parents=True)
+    first_path = owner_root / "first-image.jpg"
+    second_path = owner_root / "second-image.jpg"
+    first_path.write_bytes(b"synthetic-first-image")
+    second_path.write_bytes(b"synthetic-second-image")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    files = [
+        {
+            "file_id": "file-first",
+            "filename": "first-image.jpg",
+            "filepath": "/uploads/user-123/first-image.jpg",
+            "source": "local",
+            "context": "message_attachment",
+            "media_group_index": 0,
+        },
+        {
+            "file_id": "file-second",
+            "filename": "second-image.jpg",
+            "filepath": "/uploads/user-123/second-image.jpg",
+            "source": "local",
+            "context": "message_attachment",
+            "media_group_index": 1,
+        },
+    ]
+    encoded_files = "b64:" + base64.b64encode(json.dumps(files).encode()).decode()
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "tenant-alpha",
+            "X-Viventium-User-Id": "user-123",
+            "X-Viventium-Request-Files": encoded_files,
+        },
+    )
+
+    bundle = mcp_server._merge_request_context({"project_definition": "Inspect both images."})
+
+    assert [entry["file_id"] for entry in bundle["files"]] == [
+        "file-first",
+        "file-second",
+    ]
+    assert [entry["media_group_index"] for entry in bundle["files"]] == [0, 1]
+    assert [os.path.basename(entry["source_path"]) for entry in bundle["files"]] == [
+        "first-image.jpg",
+        "second-image.jpg",
+    ]
+
+
 def test_merge_request_context_uses_storage_user_id_for_upload_source(monkeypatch, tmp_path):
     uploads_root = tmp_path / "uploads"
     upload_path = uploads_root / "storage-user-123" / "uuid__brief with spaces.pdf"
@@ -6218,7 +6612,9 @@ def test_merge_request_context_uses_storage_user_id_for_upload_source(monkeypatc
 
     assert bundle is not None
     assert bundle["glasshive_context"]["user_id"] == "person@example.com"
-    assert bundle["glasshive_context"]["storage_user_id"] == "storage-user-123"
+    assert "storage_user_id" not in bundle["glasshive_context"]
+    assert "storage_user_id" not in bundle["viventium_context"]
+    assert '"storage_user_id"' not in json.dumps(bundle)
     assert bundle["files"][0]["path"] == "uploads/brief-with-spaces.pdf"
     assert bundle["files"][0]["source_path"] == str(upload_path)
     assert bundle["files"][0]["source_path_token"] == sign_bootstrap_source_path(
@@ -6228,11 +6624,16 @@ def test_merge_request_context_uses_storage_user_id_for_upload_source(monkeypatc
     )
 
 
-def test_explicit_uploaded_file_uses_storage_user_id_for_filename_search(monkeypatch, tmp_path):
+def test_explicit_uploaded_file_never_resolves_owner_storage_by_filename_only(
+    monkeypatch, tmp_path
+):
     uploads_root = tmp_path / "uploads"
-    upload_path = uploads_root / "storage-user-123" / "uuid__same display name.pdf"
-    upload_path.parent.mkdir(parents=True)
-    upload_path.write_bytes(b"%PDF-1.7\nsynthetic pdf bytes\n")
+    owner_root = uploads_root / "storage-user-123"
+    owner_root.mkdir(parents=True)
+    older = owner_root / "older-token__same display name.pdf"
+    newer = owner_root / "private-token__same display name.pdf"
+    older.write_bytes(b"%PDF-1.7\nolder bytes\n")
+    newer.write_bytes(b"%PDF-1.7\nprivate newer bytes\n")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
     monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
@@ -6256,8 +6657,71 @@ def test_explicit_uploaded_file_uses_storage_user_id_for_filename_search(monkeyp
         storage_owner_id=request_context.get("storage_user_id"),
     )
 
-    assert bundle["files"][0]["path"] == "uploads/same-display-name.pdf"
-    assert bundle["files"][0]["source_path"] == str(upload_path)
+    projected = bundle["files"][0]
+    assert projected["path"] == "uploads/same-display-name.pdf.metadata.json"
+    assert "source_path" not in projected
+    assert str(older) not in json.dumps(bundle)
+    assert str(newer) not in json.dumps(bundle)
+
+
+def test_local_explicit_upload_filename_uses_header_owner_not_model_bundle_scope(
+    monkeypatch,
+    tmp_path,
+):
+    uploads_root = tmp_path / "uploads"
+    own_upload = uploads_root / "owner-a" / "uuid-a__same display name.pdf"
+    other_upload = uploads_root / "owner-b" / "uuid-b__same display name.pdf"
+    own_upload.parent.mkdir(parents=True)
+    other_upload.parent.mkdir(parents=True)
+    own_upload.write_bytes(b"%PDF-1.7\nowner a\n")
+    other_upload.write_bytes(b"%PDF-1.7\nowner b\n")
+    monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "false")
+    monkeypatch.setenv("WPR_DEFAULT_EXECUTION_MODE", "docker")
+    monkeypatch.setenv("WPR_LIBRECHAT_UPLOADS_ROOT", str(uploads_root))
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda: {
+            "X-Viventium-Tenant-Id": "local",
+            "X-Viventium-User-Id": "owner-a",
+        },
+    )
+    api_client = TrackingApiClient()
+    server = create_mcp_server(api_client=api_client)
+
+    async def scenario():
+        async with Client(server) as client:
+            delegated = await client.call_tool(
+                "worker_delegate_once",
+                {
+                    "title": "Owner-scoped local upload",
+                    "instruction": "Use the attached PDF.",
+                    "profile": "codex-cli",
+                    "execution_mode": "docker",
+                    "bootstrap_bundle_json": {
+                        "glasshive_context": {
+                            "tenant_id": "forged-tenant",
+                            "user_id": "owner-b",
+                            "storage_user_id": "owner-b",
+                        }
+                    },
+                    "uploaded_files": [
+                        {
+                            "file_id": "uuid-a",
+                            "filename": "same display name.pdf",
+                            "text": "model-visible text is not file authorization",
+                        }
+                    ],
+                },
+            )
+            assert _tool_json(delegated)["status"] == "dispatched"
+
+    asyncio.run(scenario())
+    bundle = api_client.find_or_resume_payloads[0]["bootstrap_bundle"]
+    projected = bundle["files"][0]
+    assert projected["path"] == "uploads/same-display-name.pdf"
+    assert projected["source_path"] == str(own_upload)
+    assert projected["source_path"] != str(other_upload)
 
 
 def test_storage_user_id_does_not_allow_other_storage_owner_path(monkeypatch, tmp_path):
@@ -6295,10 +6759,12 @@ def test_storage_user_id_does_not_allow_other_storage_owner_path(monkeypatch, tm
     assert bundle["files"][0]["path"] == "uploads/brief.pdf.metadata.json"
     assert "source_path" not in bundle["files"][0]
     manifest = json.loads(bundle["files"][0]["content"])
-    assert manifest["source_ref"] == "/uploads/other-storage-user/uuid__brief.pdf"
+    assert "source_ref" not in manifest
 
 
-def test_legacy_upload_fallback_materializes_recent_storage_owner_file(monkeypatch, tmp_path, caplog):
+def test_legacy_upload_fallback_never_materializes_an_unselected_recent_owner_file(
+    monkeypatch, tmp_path, caplog
+):
     uploads_root = tmp_path / "uploads"
     upload_path = uploads_root / "storage-user-123" / "cb606104-3792-48ca-a767-76d67d939ba4__source report.pdf"
     upload_path.parent.mkdir(parents=True)
@@ -6342,19 +6808,10 @@ def test_legacy_upload_fallback_materializes_recent_storage_owner_file(monkeypat
     with caplog.at_level("INFO", logger="workers_projects_runtime.mcp_server"):
         asyncio.run(scenario())
     bundle = api_client.find_or_resume_payloads[-1]["bootstrap_bundle"]
-    projected = bundle["files"][0]
-    assert projected["path"] == "uploads/source-report.pdf"
-    assert projected["source_path"] == str(upload_path)
-    assert projected["source"] == "librechat_owner_recent_upload_compat"
-    assert projected["storage_user_id"] == "storage-user-123"
-    assert bundle["glasshive_upload_context"]["legacy_owner_recent_uploads"][0]["path"] == "uploads/source-report.pdf"
-    assert "`uploads/source-report.pdf`" in bundle["project_definition"]
-    assert projected["source_path_token"] == sign_bootstrap_source_path(
-        upload_path,
-        tenant_id="tenant-alpha",
-        owner_id="user@example.test",
-    )
-    assert "legacy LibreChat upload compatibility fallback materialized 1 file(s)" in caplog.text
+    assert "files" not in bundle
+    assert "legacy_owner_recent_uploads" not in json.dumps(bundle)
+    assert "storage_user_id" not in json.dumps(bundle)
+    assert "legacy LibreChat upload compatibility fallback materialized" not in caplog.text
 
 
 def test_legacy_upload_fallback_is_disabled_by_default(monkeypatch, tmp_path):
@@ -6485,7 +6942,7 @@ def test_merge_request_context_uses_metadata_manifest_when_upload_file_is_missin
     assert "source_path" not in bundle["files"][0]
     assert "source_path_token" not in bundle["files"][0]
     manifest = json.loads(bundle["files"][0]["content"])
-    assert manifest["source_ref"] == "/uploads/user-123/brief.txt"
+    assert "source_ref" not in manifest
 
 
 def test_enterprise_request_context_does_not_copy_cross_user_virtual_upload(monkeypatch, tmp_path):
@@ -6522,7 +6979,7 @@ def test_enterprise_request_context_does_not_copy_cross_user_virtual_upload(monk
     assert bundle["files"][0]["path"] == "uploads/brief.txt.metadata.json"
     assert "source_path" not in bundle["files"][0]
     manifest = json.loads(bundle["files"][0]["content"])
-    assert manifest["source_ref"] == "/uploads/other-user/brief.txt"
+    assert "source_ref" not in manifest
     assert "## Attached workspace files" in bundle["project_definition"]
     assert "`uploads/brief.txt.metadata.json`" in bundle["project_definition"]
 
@@ -6654,6 +7111,10 @@ def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_
                 "WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST=computer-use,node_repl",
                 "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE=codex-plugin-cache",
                 "WPR_HOST_CODEX_PLUGIN_CACHE=codex-plugin-cache",
+                "GLASSHIVE_HOST_PLUGIN_DENYLIST=synthetic-plugin@synthetic-marketplace",
+                "WPR_HOST_PLUGIN_DENYLIST=synthetic-plugin@synthetic-marketplace",
+                "WPR_CODEX_CLI_PERSONALITY=none",
+                "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS=exclude",
                 "WPR_CODEX_CLI_IGNORE_USER_CONFIG=false",
                 "WPR_CODEX_CLI_DISABLE_FEATURES=image_generation",
                 "WPR_CODEX_CLI_PROVIDER_NAME=GlassHive Test Provider",
@@ -6672,6 +7133,10 @@ def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_
         "WPR_HOST_CODEX_NATIVE_MCP_ALLOWLIST",
         "GLASSHIVE_HOST_CODEX_PLUGIN_CACHE",
         "WPR_HOST_CODEX_PLUGIN_CACHE",
+        "GLASSHIVE_HOST_PLUGIN_DENYLIST",
+        "WPR_HOST_PLUGIN_DENYLIST",
+        "WPR_CODEX_CLI_PERSONALITY",
+        "WPR_CODEX_CLI_CONVERSATION_PROJECT_INSTRUCTIONS",
         "WPR_CODEX_CLI_IGNORE_USER_CONFIG",
         "WPR_CODEX_CLI_DISABLE_FEATURES",
         "WPR_CODEX_CLI_PROVIDER_NAME",
@@ -6690,6 +7155,9 @@ def test_runtime_env_loads_host_worker_native_capability_knobs(monkeypatch, tmp_
         assert os.environ[key] == loaded[key]
     assert os.environ["WPR_CLAUDE_CODE_EFFORT"] == "max"
     assert "computer-use" in os.environ["GLASSHIVE_HOST_CODEX_NATIVE_MCP_ALLOWLIST"]
+    assert os.environ["GLASSHIVE_HOST_PLUGIN_DENYLIST"] == (
+        "synthetic-plugin@synthetic-marketplace"
+    )
 
 
 def test_merge_request_context_projects_extracted_upload_text(monkeypatch):

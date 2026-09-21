@@ -20,6 +20,8 @@ from workers_projects_runtime.docker_sandbox import (
     AI_WORKER_CODEX_NPM_SPEC,
     AI_WORKER_PYTHON_LOCK_PATH,
     DockerSandboxManager,
+    FreshSandboxInspection,
+    PARALLEL_CLEAN_ROOM_TMPFS,
     SandboxInfo,
     VNC_PASSWORD_ALPHABET,
     _CLAUDE_WORKSPACE_ONBOARDING_SCRIPT,
@@ -33,6 +35,7 @@ from workers_projects_runtime.bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
     GLASSHIVE_NATIVE_CAPABILITY_INVENTORY,
     GLASSHIVE_SAFETY_CHECKPOINT_RULE,
+    PARALLEL_CLEAN_ROOM_EXECUTION_POLICY,
 )
 from workers_projects_runtime.openclaw_release import (
     OPENCLAW_RUNTIME_FAST_URI_VERSION,
@@ -3995,7 +3998,12 @@ def test_terminate_invalidates_inspect_cache_before_idle_resume(tmp_path):
         nonlocal exists
         if args[:1] == ["inspect"]:
             calls.append("inspect")
-            return subprocess.CompletedProcess(["docker", *args], returncode=0 if exists else 1, stdout=running_payload() if exists else "", stderr="")
+            return subprocess.CompletedProcess(
+                ["docker", *args],
+                returncode=0 if exists else 1,
+                stdout=running_payload() if exists else "",
+                stderr="" if exists else "Error: No such object: wpr-wrk-test",
+            )
         if args[:2] == ["rm", "-f"]:
             calls.append("rm")
             exists = False
@@ -6134,7 +6142,8 @@ def test_ensure_ready_repairs_bind_mount_ownership_before_prime(tmp_path):
 
     assert calls[0] == "create"
     assert calls[1].startswith("root:")
-    assert "setfacl -R -m u:seluser:rwX" in calls[1]
+    assert "chown -R" not in calls[1]
+    assert "chmod -R" not in calls[1]
     assert (
         "find /workspace/project /workspace/.wpr-home /workspace/.wpr-home/tmp "
         "/workspace/.wpr-home/.cache /workspace/.wpr-home/.config -type d -exec setfacl"
@@ -6206,13 +6215,13 @@ def test_ensure_container_writable_paths_repairs_specific_run_dir(tmp_path):
         (
             "root",
             [
-                "bash",
-                "-c",
-                "set -e; mkdir -p /workspace/.wpr-home/.glasshive-runs/run_123; "
-                "if command -v setfacl >/dev/null 2>&1 "
-                f"&& setfacl -R -m u:seluser:rwX,u:{os.getuid()}:rwX /workspace/.wpr-home/.glasshive-runs/run_123 2>/dev/null; then "
-                f"find /workspace/.wpr-home/.glasshive-runs/run_123 -type d -exec setfacl -m d:u:seluser:rwX,d:u:{os.getuid()}:rwX {{}} + 2>/dev/null || true; "
-                "else chmod -R a+rwX /workspace/.wpr-home/.glasshive-runs/run_123 2>/dev/null || true; fi",
+                    "bash",
+                    "-c",
+                    "set -e; mkdir -p /workspace/.wpr-home/.glasshive-runs/run_123; "
+                    "find /workspace/.wpr-home/.glasshive-runs/run_123 -xdev ! -type s ! -type l "
+                    "! -user seluser -exec chown -h seluser {} +; "
+                    "find /workspace/.wpr-home/.glasshive-runs/run_123 -xdev ! -type s "
+                    "! -type l -exec chmod u+rwX,go-rwx {} +",
             ],
         )
     ]
@@ -6367,7 +6376,7 @@ def test_create_container_applies_default_resource_caps(tmp_path):
     assert command[command.index("--memory") + 1] == "3g"
     assert command[command.index("--memory-swap") + 1] == "3g"
     assert command[command.index("--cpus") + 1] == "2"
-    assert command[command.index("--pids-limit") + 1] == "4096"
+    assert command[command.index("--pids-limit") + 1] == "512"
     assert command[-1] == manager.image
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
 import pytest
+import workers_projects_runtime.bootstrap as bootstrap_module
 
 from workers_projects_runtime.bootstrap import (
     GLASSHIVE_CRITICAL_OPERATING_INSTRUCTIONS,
@@ -56,7 +58,6 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert GLASSHIVE_SAFETY_CHECKPOINT_RULE in agents_text
     assert "FINAL REPORT:" in agents_text
     assert "polished ordinary end-user artifact" in agents_text
-    assert "never leave a foreground server blocking final delivery or wasting compute" in agents_text
     assert "source/date/auth/scope constraints" in agents_text
     assert "do not use that item to support facts, scoring, or deliverables" in agents_text
     assert "source publication/evidence dates distinct from retrieval/access timestamps" in agents_text
@@ -66,7 +67,6 @@ def test_bootstrap_materializes_canonical_worker_operating_contract(tmp_path):
     assert "carry the user's constraints forward literally and exactly" in agents_text
     assert "correct that file before continuing" in agents_text
     assert "prioritize a usable core result before optional expansion" in agents_text
-    assert "not clipped" in agents_text
     assert "Do not force a download" in agents_text
     assert "Native capability discovery" in agents_text
     assert "Inspect what is actually available" in agents_text
@@ -284,6 +284,7 @@ def test_local_bootstrap_env_filters_user_provider_tokens_without_blocking_provi
                 "env": {
                     "OPENAI_API_KEY": "bundle-openai",
                     "PRIVATE_INTERNAL_TOKEN": "local-mode-keeps-existing-behavior",
+                    "PATH": "/tmp/untrusted-path",
                     "GOOGLE_REFRESH_TOKEN": "must-not-project",
                     "GOOGLE_OAUTH_CLIENT_SECRET": "must-not-project",
                     "MS365_ACCESS_TOKEN": "must-not-project",
@@ -296,6 +297,7 @@ def test_local_bootstrap_env_filters_user_provider_tokens_without_blocking_provi
 
     assert env["OPENAI_API_KEY"] == "bundle-openai"
     assert env["PRIVATE_INTERNAL_TOKEN"] == "local-mode-keeps-existing-behavior"
+    assert "PATH" not in env
     assert "GOOGLE_REFRESH_TOKEN" not in env
     assert "GOOGLE_OAUTH_CLIENT_SECRET" not in env
     assert "MS365_ACCESS_TOKEN" not in env

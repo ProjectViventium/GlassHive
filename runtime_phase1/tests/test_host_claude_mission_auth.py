@@ -154,7 +154,10 @@ def test_owner_login_keeps_retained_session_directory(mission, monkeypatch, tmp_
     assert env['HOME'] == str(owner)
     assert env['CLAUDE_SECURESTORAGE_CONFIG_DIR'] == ''
     assert 'CLAUDE_CODE_OAUTH_REFRESH_TOKEN' not in env
-    assert probes[-1] == env
+    expected_probe = dict(env)
+    if installed:
+        expected_probe.pop('CLAUDE_CONFIG_DIR', None)
+    assert probes[-1] == expected_probe
 
 
 def test_unavailable_split_login_does_not_relocate_session(mission, monkeypatch, tmp_path):

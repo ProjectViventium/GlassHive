@@ -1207,6 +1207,269 @@ def _capacity_vector(value: dict[str, Any] | None) -> dict[str, int]:
 def _capacity_json(value: dict[str, Any] | None) -> str:
     return json.dumps(_capacity_vector(value), sort_keys=True, separators=(",", ":"))
 
+WORK_STOP_FIELD_NAMES = frozenset(
+    {
+        "work_stop_id",
+        "work_stop_requested_at",
+        "work_stop_settled_at",
+        "work_stop_outcome",
+    }
+)
+CANCELLATION_CLEAR_FIELDS: dict[str, Any] = {
+    "failure_class": "",
+    "failure_retryable": 0,
+    "failure_structured": 0,
+    "failure_user_message": "",
+    "failure_recommended_recovery": "",
+    "failure_diagnostic_summary": "",
+    "retry_after": None,
+    "retry_attempts": 0,
+    "capacity_retry_count": 0,
+    "last_retry_class": "",
+}
+
+COMPUTE_OPERATION_KINDS = frozenset(
+    {
+        "idle",
+        "needs_input",
+        "paused",
+        "pause_worker",
+        "resume_worker",
+        "max_duration",
+        "pause_run",
+        "resume_run",
+        "interrupt_run",
+        "steer_run",
+        "stop_run",
+        "terminate_worker",
+    }
+)
+COMPUTE_OPERATION_SCOPES = frozenset({"compute_only", "run", "work", "worker"})
+COMPUTE_OPERATION_SCOPE_BY_KIND = {
+    "idle": "compute_only",
+    "needs_input": "compute_only",
+    "paused": "compute_only",
+    "pause_worker": "compute_only",
+    "resume_worker": "compute_only",
+    "max_duration": "run",
+    "pause_run": "run",
+    "resume_run": "run",
+    "interrupt_run": "run",
+    "steer_run": "run",
+    "stop_run": "work",
+    "terminate_worker": "worker",
+}
+RUN_SCOPED_OPERATION_KINDS = frozenset(
+    {
+        "paused",
+        "max_duration",
+        "pause_run",
+        "resume_run",
+        "interrupt_run",
+        "steer_run",
+        "stop_run",
+    }
+)
+STOPPING_OPERATION_KINDS = frozenset(
+    {"max_duration", "stop_run", "terminate_worker"}
+)
+NONTERMINAL_RUN_STATES = frozenset(
+    {"queued", "claimed", "admitted", "running", "settling", "paused", "needs_input"}
+)
+EXECUTING_RUN_STATES = frozenset(
+    {"claimed", "admitted", "running", "settling", "paused", "needs_input"}
+)
+PROCESS_BEARING_RUN_STATES = frozenset({"running", "settling", "paused"})
+TERMINAL_RUN_STATES = frozenset(
+    {"completed", "failed", "cancelled", "interrupted"}
+)
+STEER_REPLACEMENT_SUPPRESSED_ERROR = (
+    "Steer replacement suppressed because target completed"
+)
+RUNTIME_INFO_FIELD_NAMES = frozenset(
+    {
+        "runtime",
+        "model",
+        "gateway_url",
+        "gateway_port",
+        "gateway_token",
+        "session_key",
+        "state_dir",
+        "workspace_dir",
+        "pid",
+        "takeover_url",
+        "control_url",
+        "last_error",
+    }
+)
+COMPUTE_OPERATION_CLEAR_FIELDS: dict[str, Any] = {
+    "compute_release_token": "",
+    "compute_release_owner": "",
+    "compute_release_claimed_at": None,
+    "compute_release_expires_at": None,
+    "compute_release_kind": "",
+    "compute_release_scope": "compute_only",
+    "compute_release_container_id": "",
+    "compute_release_session_fingerprint": "",
+    "compute_release_target_run_id": "",
+    "compute_release_target_started_at": "",
+    "compute_release_terminal_run_id": "",
+    "compute_release_replacement_run_id": "",
+    "compute_release_runtime_confirmed_at": None,
+    "compute_release_runtime_proof_digest": "",
+    "compute_release_operation_id": "",
+}
+LIFECYCLE_EFFECT_KINDS = frozenset(
+    {
+        "callback.run_cancelled",
+        "callback.run_paused",
+        "callback.run_resumed",
+        "callback.run_resumed_in_place",
+        "callback.run_resumed_queued",
+        "callback.run_interrupted",
+        "callback.run_steered",
+        "callback.run_needs_input",
+        "callback.work_stopped",
+        "callback.worker_paused",
+        "callback.worker_resumed",
+        "callback.worker_terminated",
+        "signed_links.revoke_worker",
+    }
+)
+LIFECYCLE_EFFECT_ERROR_CODES = frozenset(
+    {
+        "callback_config_missing",
+        "callback_build_failed",
+        "callback_enqueue_failed",
+        "signed_link_revoke_failed",
+        "transient_dependency",
+        "unknown",
+    }
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CAPACITY_RESOURCE_KEYS = (
+    "childProcesses",
+    "threads",
+    "memoryBytes",
+    "diskBytes",
+)
+
+
+
+QUEUE_WAIT_TIMEOUT_ENV = "GLASSHIVE_QUEUE_WAIT_TIMEOUT_S"
+QUEUE_STATUS_REFRESH_INTERVAL_ENV = "GLASSHIVE_QUEUE_STATUS_REFRESH_INTERVAL_S"
+ACTIVE_WORK_TERMINAL_RECENCY_ENV = "GLASSHIVE_ACTIVE_WORK_TERMINAL_RECENCY_S"
+ACTIVE_WORK_TERMINAL_PER_STATE_ENV = "GLASSHIVE_ACTIVE_WORK_TERMINAL_RECENT_PER_STATE"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+TERMINAL_RESULT_DIGEST_FIELDS = (
+    "state",
+    "ended_at",
+    "active_attempt_id",
+    "output_text",
+    "error_text",
+    "failure_class",
+    "failure_retryable",
+    "failure_structured",
+    "failure_user_message",
+    "failure_recommended_recovery",
+    "failure_diagnostic_summary",
+)
+
+
+
+
+
+
+
+
+CALLBACK_TRACE_SNAPSHOT_FIELDS = (
+    "callbackId",
+    "projectId",
+    "workerId",
+    "tenantId",
+    "runId",
+    "attemptNumber",
+    "event",
+    "url",
+    "payloadJson",
+    "resultRevision",
+    "resultDigest",
+    "status",
+    "attempts",
+    "lastError",
+    "createdAt",
+    "updatedAt",
+    "deliveredAt",
+    "httpAcceptedAt",
+    "deliveryLeaseToken",
+    "deliveryGeneration",
+    "deliveryLeaseExpiresAt",
+)
+CALLBACK_TRACE_AUTHORITY_FIELDS = (
+    "callbackId",
+    "projectId",
+    "workerId",
+    "tenantId",
+    "runId",
+    "attemptNumber",
+    "event",
+    "url",
+    "resultRevision",
+    "resultDigest",
+    "deliveryLeaseToken",
+    "deliveryGeneration",
+    "deliveryLeaseExpiresAt",
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def _normalized_failure_fields(fields: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key in _FAILURE_FIELD_NAMES:
@@ -1257,6 +1520,7 @@ class Store:
             # Join the fully initialized WAL database. A connection opened before
             # the first WAL transaction does not keep SQLite's sidecars resident.
             self.open()
+            self.reconcile_invalid_running_runs()
             self._secure_state_files()
         except BaseException:
             self.close()
@@ -1398,6 +1662,13 @@ class Store:
             execute_schema_script(
                 conn,
                 """
+                PRAGMA journal_mode=WAL;
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    completed_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS projects (
                     project_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL DEFAULT 'local',
@@ -1421,6 +1692,9 @@ class Store:
                     profile TEXT NOT NULL,
                     backend TEXT NOT NULL,
                     execution_mode TEXT NOT NULL DEFAULT 'docker',
+                    trusted_run_lane TEXT NOT NULL DEFAULT 'mission',
+                    resource_class TEXT NOT NULL DEFAULT 'standard',
+                    resource_memory_bytes INTEGER NOT NULL DEFAULT 3221225472,
                     alias TEXT,
                     runtime TEXT NOT NULL,
                     model TEXT NOT NULL,
@@ -1441,6 +1715,26 @@ class Store:
                     workspace_tags_json TEXT NOT NULL DEFAULT '[]',
                     duplication_report_json TEXT NOT NULL DEFAULT '{}',
                     compute_released_at TEXT,
+                    compute_release_token TEXT NOT NULL DEFAULT '',
+                    compute_release_owner TEXT NOT NULL DEFAULT '',
+                    compute_release_claimed_at TEXT,
+                    compute_release_expires_at TEXT,
+                    compute_release_epoch INTEGER NOT NULL DEFAULT 0,
+                    compute_release_kind TEXT NOT NULL DEFAULT '',
+                    compute_release_scope TEXT NOT NULL DEFAULT 'compute_only',
+                    compute_release_container_id TEXT NOT NULL DEFAULT '',
+                    compute_release_session_fingerprint TEXT NOT NULL DEFAULT '',
+                    compute_release_target_run_id TEXT NOT NULL DEFAULT '',
+                    compute_release_target_started_at TEXT NOT NULL DEFAULT '',
+                    compute_release_terminal_run_id TEXT NOT NULL DEFAULT '',
+                    compute_release_replacement_run_id TEXT NOT NULL DEFAULT '',
+                    compute_release_runtime_confirmed_at TEXT,
+                    compute_release_runtime_proof_digest TEXT NOT NULL DEFAULT '',
+                    compute_release_operation_id TEXT NOT NULL DEFAULT '',
+                    work_stop_id TEXT NOT NULL DEFAULT '',
+                    work_stop_requested_at TEXT,
+                    work_stop_settled_at TEXT,
+                    work_stop_outcome TEXT NOT NULL DEFAULT '',
                     pid INTEGER,
                     last_run_id TEXT,
                     last_error TEXT,
@@ -1484,35 +1778,121 @@ class Store:
                     instruction TEXT NOT NULL,
                     state TEXT NOT NULL,
                     queued_at TEXT NOT NULL,
+                    first_queued_at TEXT NOT NULL,
+                    queue_deadline_at TEXT NOT NULL,
+                    queue_blocker_class TEXT NOT NULL DEFAULT 'admission_pending',
+                    queue_next_status_at TEXT,
+                    queue_wait_episode INTEGER NOT NULL DEFAULT 1,
+                    queue_wait_open INTEGER NOT NULL DEFAULT 1,
+                    queue_wait_generation INTEGER NOT NULL DEFAULT 1,
+                    queue_wait_started_at TEXT NOT NULL,
+                    queue_wait_closed_at TEXT,
+                    queue_wait_duration_seconds INTEGER,
+                    queue_transition_emitted INTEGER NOT NULL DEFAULT 0,
+                    queue_status_sequence INTEGER NOT NULL DEFAULT 0,
+                    queue_callback_state TEXT NOT NULL DEFAULT 'unknown',
+                    queue_terminal_callback_id TEXT NOT NULL DEFAULT '',
+                    claimed_at TEXT,
+                    admitted_at TEXT,
                     started_at TEXT,
+                    runtime_invoked_at TEXT,
+                    active_attempt_id TEXT NOT NULL DEFAULT '',
                     ended_at TEXT,
                     output_text TEXT NOT NULL,
                     error_text TEXT NOT NULL,
+                    terminal_result_revision INTEGER NOT NULL DEFAULT 0,
                     failure_class TEXT NOT NULL DEFAULT '',
                     failure_retryable INTEGER NOT NULL DEFAULT 0,
+                    failure_structured INTEGER NOT NULL DEFAULT 0,
                     failure_user_message TEXT NOT NULL DEFAULT '',
                     failure_recommended_recovery TEXT NOT NULL DEFAULT '',
                     failure_diagnostic_summary TEXT NOT NULL DEFAULT '',
                     runtime_bundle_json TEXT,
                     retry_after TEXT,
                     retry_attempts INTEGER NOT NULL DEFAULT 0,
+                    capacity_retry_count INTEGER NOT NULL DEFAULT 0,
                     last_retry_class TEXT NOT NULL DEFAULT '',
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    native_session_id TEXT NOT NULL DEFAULT '',
+                    native_capabilities_json TEXT NOT NULL DEFAULT '{}',
+                    native_child_summary_json TEXT NOT NULL DEFAULT '{}',
+                    liveness_started_at TEXT,
+                    meaningful_progress_at TEXT,
+                    meaningful_progress_sequence INTEGER NOT NULL DEFAULT 0,
+                    internal_retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_internal_retry_class TEXT NOT NULL DEFAULT '',
+                    liveness_mode TEXT NOT NULL DEFAULT 'standard',
+                    provider_liveness_route_locked INTEGER NOT NULL DEFAULT 0,
+                    capacity_class TEXT NOT NULL DEFAULT '',
+                    capacity_available_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_required_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_shortage_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_reservation_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_next_retry_at TEXT,
+                    provider_route_profile TEXT NOT NULL DEFAULT '',
+                    provider_route_runtime TEXT NOT NULL DEFAULT '',
+                    provider_route_model TEXT NOT NULL DEFAULT '',
+                    provider_route_decision TEXT NOT NULL DEFAULT '',
+                    provider_route_from_profile TEXT NOT NULL DEFAULT '',
+                    provider_route_from_runtime TEXT NOT NULL DEFAULT '',
+                    provider_route_from_model TEXT NOT NULL DEFAULT '',
+                    provider_route_failure_class TEXT NOT NULL DEFAULT '',
+                    provider_route_cooldown_until TEXT,
+                    continuation_contract_json TEXT NOT NULL DEFAULT '{}',
+                    continuation_context_json TEXT NOT NULL DEFAULT '{}',
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS run_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    admitted_at TEXT,
+                    runtime_invoked_at TEXT,
+                    provider_health_observed_last_failed_at TEXT,
+                    provider_health_observed_generation INTEGER,
+                    ended_at TEXT,
+                    lease_id TEXT NOT NULL DEFAULT '',
+                    capacity_class TEXT NOT NULL DEFAULT '',
+                    capacity_available_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_required_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_shortage_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_reservation_json TEXT NOT NULL DEFAULT '{}',
+                    capacity_next_retry_at TEXT,
+                    terminal_reason TEXT NOT NULL DEFAULT '',
+                    UNIQUE(run_id, attempt_number),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS capacity_attempts (
+                    capacity_attempt_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    attempt_id TEXT NOT NULL DEFAULT '',
+                    capacity_class TEXT NOT NULL,
+                    available_json TEXT NOT NULL DEFAULT '{}',
+                    required_json TEXT NOT NULL DEFAULT '{}',
+                    shortage_json TEXT NOT NULL DEFAULT '{}',
+                    reservation_json TEXT NOT NULL DEFAULT '{}',
+                    next_retry_at TEXT,
+                    observed_at TEXT NOT NULL,
+                    UNIQUE(run_id, sequence),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
 
                 CREATE TABLE IF NOT EXISTS provider_account_run_fences (
                     run_id TEXT PRIMARY KEY,
                     account_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
                 );
-                CREATE INDEX IF NOT EXISTS idx_provider_account_run_fences_account
-                    ON provider_account_run_fences(account_id, run_id);
 
                 CREATE TABLE IF NOT EXISTS events (
                     event_id TEXT PRIMARY KEY,
@@ -1522,6 +1902,7 @@ class Store:
                     run_id TEXT,
                     event_type TEXT NOT NULL,
                     message TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
@@ -1533,18 +1914,155 @@ class Store:
                     worker_id TEXT NOT NULL,
                     tenant_id TEXT NOT NULL DEFAULT 'local',
                     run_id TEXT,
+                    attempt_number INTEGER NOT NULL DEFAULT 0,
                     event_type TEXT NOT NULL,
                     url TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
+                    result_revision INTEGER NOT NULL DEFAULT 0,
+                    result_digest TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     delivered_at TEXT,
+                    http_accepted_at TEXT,
+                    delivery_lease_token TEXT NOT NULL DEFAULT '',
+                    delivery_generation INTEGER NOT NULL DEFAULT 0,
+                    delivery_lease_expires_at TEXT,
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS callback_trace_events (
+                    callback_trace_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    callback_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    callback_sequence INTEGER NOT NULL,
+                    run_sequence INTEGER NOT NULL,
+                    mutation_kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    authority_sha256 TEXT NOT NULL,
+                    previous_event_sha256 TEXT NOT NULL DEFAULT '',
+                    event_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(callback_id, callback_sequence),
+                    UNIQUE(run_id, run_sequence),
+                    FOREIGN KEY(callback_id) REFERENCES callback_outbox(callback_id),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS callback_trace_events_run_idx
+                    ON callback_trace_events(run_id, run_sequence);
+
+                CREATE TRIGGER IF NOT EXISTS callback_trace_events_append_only_update
+                BEFORE UPDATE ON callback_trace_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'callback trace is append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS callback_trace_events_append_only_delete
+                BEFORE DELETE ON callback_trace_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'callback trace is append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS terminal_callback_reconciliations (
+                    run_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    ended_at TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL DEFAULT 0,
+                    callback_contract_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        run_id, state, ended_at, attempt_number,
+                        callback_contract_digest
+                    ),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS terminal_callback_results (
+                    receiver_scope TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    callback_id TEXT NOT NULL,
+                    result_revision INTEGER NOT NULL,
+                    result_digest TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (receiver_scope, run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS terminal_callback_result_attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receiver_scope TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    callback_id TEXT NOT NULL,
+                    result_revision INTEGER NOT NULL,
+                    result_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    current_result_revision INTEGER NOT NULL,
+                    current_result_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS lifecycle_operation_effects (
+                    effect_id TEXT PRIMARY KEY,
+                    operation_digest TEXT NOT NULL,
+                    operation_epoch INTEGER NOT NULL,
+                    operation_kind TEXT NOT NULL,
+                    effect_kind TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_epoch INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at TEXT,
+                    next_attempt_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    applied_at TEXT,
+                    UNIQUE(
+                        operation_digest, operation_epoch, operation_kind,
+                        effect_kind, worker_id, run_id
+                    ),
+                    FOREIGN KEY(worker_id) REFERENCES workers(worker_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS capability_grant_revocations (
+                    revocation_id TEXT PRIMARY KEY,
+                    authorization_ref TEXT NOT NULL,
+                    origin_ref TEXT NOT NULL,
+                    work_ref TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    grant_id TEXT NOT NULL,
+                    container_generation_id TEXT NOT NULL,
+                    host_startup_lease_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'armed',
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_epoch INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at TEXT,
+                    next_attempt_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    applied_at TEXT,
+                    UNIQUE(grant_id, container_generation_id),
+                    FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS capability_grant_revocations_pending_idx
+                    ON capability_grant_revocations(
+                        status, next_attempt_at, lease_expires_at, created_at
+                    );
 
                 CREATE TABLE IF NOT EXISTS run_action_uses (
                     capability_id TEXT PRIMARY KEY,
@@ -1564,6 +2082,157 @@ class Store:
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
                     FOREIGN KEY(source_run_id) REFERENCES runs(run_id),
                     FOREIGN KEY(new_run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS service_assertion_nonces (
+                    audience TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    issued_at_epoch INTEGER NOT NULL,
+                    expires_at_epoch INTEGER NOT NULL,
+                    request_method TEXT NOT NULL,
+                    request_path TEXT NOT NULL,
+                    consumed_at TEXT NOT NULL,
+                    PRIMARY KEY (audience, tenant_id, owner_id, nonce)
+                );
+
+                CREATE TABLE IF NOT EXISTS delegations (
+                    work_ref TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    origin_ref TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL,
+                    origin_surface TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    initial_run_id TEXT NOT NULL,
+                    current_run_id TEXT NOT NULL,
+                    dismissed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant_id, owner_id, idempotency_key),
+                    FOREIGN KEY(project_id) REFERENCES projects(project_id),
+                    FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
+                    FOREIGN KEY(initial_run_id) REFERENCES runs(run_id),
+                    FOREIGN KEY(current_run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS work_trace_events (
+                    trace_event_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    work_ref TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    previous_event_sha256 TEXT NOT NULL DEFAULT '',
+                    event_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (run_id, sequence),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+                    FOREIGN KEY(work_ref) REFERENCES delegations(work_ref)
+                );
+
+                CREATE INDEX IF NOT EXISTS work_trace_events_scope_idx
+                    ON work_trace_events(run_id, tenant_id, owner_id, sequence);
+
+                CREATE TRIGGER IF NOT EXISTS work_trace_events_append_only_update
+                BEFORE UPDATE ON work_trace_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'work trace is append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS work_trace_events_append_only_delete
+                BEFORE DELETE ON work_trace_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'work trace is append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS active_work_action_uses (
+                    action_use_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    work_ref TEXT NOT NULL,
+                    source_run_id TEXT NOT NULL DEFAULT '',
+                    effect_phase TEXT NOT NULL DEFAULT '',
+                    lifecycle_operation_id TEXT NOT NULL DEFAULT '',
+                    lifecycle_operation_kind TEXT NOT NULL DEFAULT '',
+                    lifecycle_target_run_id TEXT NOT NULL DEFAULT '',
+                    executor_id TEXT NOT NULL DEFAULT '',
+                    lease_expires_at TEXT,
+                    idempotency_key TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    source_context_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    response_json TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (tenant_id, owner_id, work_ref, idempotency_key),
+                    FOREIGN KEY(work_ref) REFERENCES delegations(work_ref)
+                );
+
+                CREATE TABLE IF NOT EXISTS host_run_leases (
+                    lease_id TEXT PRIMARY KEY,
+                    runtime_family TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    executor_id TEXT NOT NULL,
+                    pid INTEGER,
+                    process_group INTEGER,
+                    process_start_identity TEXT NOT NULL DEFAULT '',
+                    startup_token TEXT NOT NULL DEFAULT '',
+                    startup_state TEXT NOT NULL DEFAULT 'legacy_unknown',
+                    startup_confirmed_at TEXT,
+                    startup_identity_kind TEXT NOT NULL DEFAULT '',
+                    startup_container_id TEXT NOT NULL DEFAULT '',
+                    startup_session_id TEXT NOT NULL DEFAULT '',
+                    mutation_scope TEXT NOT NULL DEFAULT '',
+                    attempt_id TEXT NOT NULL DEFAULT '',
+                    reserved_child_processes INTEGER NOT NULL DEFAULT 0,
+                    reserved_threads INTEGER NOT NULL DEFAULT 0,
+                    reserved_memory_bytes INTEGER NOT NULL DEFAULT 0,
+                    reserved_disk_bytes INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    reconciled_at TEXT,
+                    released_at TEXT,
+                    release_reason TEXT NOT NULL DEFAULT '',
+                    UNIQUE (run_id),
+                    FOREIGN KEY(worker_id) REFERENCES workers(worker_id),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS preflight_capacity_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    runtime_family TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    execution_mode TEXT NOT NULL,
+                    executor_id TEXT NOT NULL,
+                    mutation_scope TEXT NOT NULL DEFAULT '',
+                    reserved_child_processes INTEGER NOT NULL DEFAULT 0,
+                    reserved_threads INTEGER NOT NULL DEFAULT 0,
+                    reserved_memory_bytes INTEGER NOT NULL DEFAULT 0,
+                    reserved_disk_bytes INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    released_at TEXT,
+                    release_reason TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS scheduled_runs (
@@ -1685,9 +2354,35 @@ class Store:
                     context_manifest_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE (tenant_id, owner_id, conversation_id, agent_id, actor_kind, origin),
+                    UNIQUE (
+                        tenant_id, owner_id, conversation_id, agent_id,
+                        actor_kind, origin
+                    ),
                     FOREIGN KEY(project_id) REFERENCES projects(project_id),
                     FOREIGN KEY(worker_id) REFERENCES workers(worker_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_session_visible_admissions (
+                    session_id TEXT NOT NULL,
+                    message_key TEXT NOT NULL,
+                    advancement_key TEXT NOT NULL DEFAULT '',
+                    accepted_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, message_key),
+                    FOREIGN KEY(session_id) REFERENCES provider_sessions(session_id)
+                        ON UPDATE CASCADE ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_main_contexts (
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    continuity_domain_id TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, owner_id, agent_id),
+                    UNIQUE (tenant_id, owner_id, continuity_domain_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS provider_requests (
@@ -1701,7 +2396,16 @@ class Store:
                     stream_id TEXT NOT NULL DEFAULT '',
                     state TEXT NOT NULL,
                     requested_history_count INTEGER NOT NULL DEFAULT 0,
+                    replay_decision_json TEXT NOT NULL DEFAULT '{}',
+                    admitted_instruction TEXT NOT NULL DEFAULT '',
                     response_json TEXT NOT NULL DEFAULT '',
+                    fallback_model_id TEXT NOT NULL DEFAULT '',
+                    fallback_reasoning_effort TEXT NOT NULL DEFAULT '',
+                    fallback_instruction TEXT NOT NULL DEFAULT '',
+                    fallback_state TEXT NOT NULL DEFAULT '',
+                    fallback_from_run_id TEXT NOT NULL DEFAULT '',
+                    response_timeout_s REAL,
+                    response_deadline_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE (tenant_id, owner_id, idempotency_key),
@@ -1719,24 +2423,128 @@ class Store:
                     FOREIGN KEY(request_id) REFERENCES provider_requests(request_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS provider_route_health (
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    runtime TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    failure_class TEXT NOT NULL,
+                    failure_count INTEGER NOT NULL DEFAULT 1,
+                    failure_generation INTEGER NOT NULL DEFAULT 1,
+                    first_failed_at TEXT NOT NULL,
+                    last_failed_at TEXT NOT NULL,
+                    cooldown_until TEXT NOT NULL,
+                    cooldown_source TEXT NOT NULL,
+                    last_run_id TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, owner_id, profile, runtime, model)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_route_health_events (
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    runtime TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    evidence_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL DEFAULT '',
+                    attempt_id TEXT NOT NULL DEFAULT '',
+                    evidence_kind TEXT NOT NULL DEFAULT '',
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        tenant_id, owner_id, profile, runtime, model, evidence_id
+                    )
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_liveness_events (
+                    event_ref TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    failure_class TEXT NOT NULL DEFAULT '',
+                    runtime TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    source_sequence INTEGER NOT NULL,
+                    source_digest TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id),
+                    FOREIGN KEY(attempt_id) REFERENCES run_attempts(attempt_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_stop_tombstones (
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    owner_id TEXT NOT NULL,
+                    base_idempotency_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, owner_id, base_idempotency_key)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_workers_project_id ON workers(project_id);
                 CREATE INDEX IF NOT EXISTS idx_runs_worker_state ON runs(worker_id, state, queued_at);
+                CREATE INDEX IF NOT EXISTS idx_runs_state_retry_after_worker ON runs(state, retry_after, worker_id);
+                CREATE INDEX IF NOT EXISTS idx_run_attempts_run_number
+                    ON run_attempts(run_id, attempt_number);
+                CREATE INDEX IF NOT EXISTS idx_run_attempts_state
+                    ON run_attempts(state, claimed_at);
+                CREATE INDEX IF NOT EXISTS idx_provider_liveness_run_observed
+                    ON provider_liveness_events(run_id, observed_at, event_ref);
+                CREATE INDEX IF NOT EXISTS idx_capacity_attempts_run_sequence
+                    ON capacity_attempts(run_id, sequence);
                 CREATE INDEX IF NOT EXISTS idx_events_worker_created ON events(worker_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_callback_outbox_status_updated ON callback_outbox(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_lifecycle_effects_status_lease
+                    ON lifecycle_operation_effects(status, lease_expires_at, created_at);
                 CREATE INDEX IF NOT EXISTS idx_run_action_uses_source ON run_action_uses(source_run_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_service_assertion_nonces_expiry ON service_assertion_nonces(expires_at_epoch);
+                CREATE INDEX IF NOT EXISTS idx_delegations_owner_updated ON delegations(tenant_id, owner_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_active_work_action_uses_work ON active_work_action_uses(work_ref, created_at);
+                CREATE INDEX IF NOT EXISTS idx_host_run_leases_active_family_lane
+                    ON host_run_leases(status, runtime_family, lane, heartbeat_at);
+                CREATE INDEX IF NOT EXISTS idx_host_run_leases_active_owner
+                    ON host_run_leases(status, tenant_id, owner_id, lane);
+                CREATE INDEX IF NOT EXISTS idx_preflight_capacity_active_family_lane
+                    ON preflight_capacity_reservations(
+                        status, runtime_family, lane, expires_at
+                    );
                 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_state_run_at ON scheduled_runs(state, run_at);
-                CREATE INDEX IF NOT EXISTS idx_recurring_definitions_due
-                    ON recurring_schedule_definitions(scheduler_owner, active, next_run_at);
-                CREATE INDEX IF NOT EXISTS idx_recurring_definitions_scope
-                    ON recurring_schedule_definitions(tenant_id, owner_id, worker_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_recurring_occurrences_scope
-                    ON recurring_schedule_occurrences(tenant_id, owner_id, definition_id, scheduled_for DESC);
                 CREATE INDEX IF NOT EXISTS idx_provider_sessions_owner ON provider_sessions(tenant_id, owner_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_provider_sessions_worker ON provider_sessions(worker_id);
+                CREATE INDEX IF NOT EXISTS idx_provider_visible_admissions_advancement
+                    ON provider_session_visible_admissions(session_id, advancement_key)
+                    WHERE advancement_key <> '';
                 CREATE INDEX IF NOT EXISTS idx_provider_requests_session ON provider_requests(session_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_provider_requests_state_updated
+                    ON provider_requests(state, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_provider_activity_request ON provider_activity(request_id, sequence_id);
+                CREATE INDEX IF NOT EXISTS idx_provider_route_health_expiry
+                    ON provider_route_health(cooldown_until);
+                CREATE INDEX IF NOT EXISTS idx_provider_route_health_events_attempt
+                    ON provider_route_health_events(run_id, attempt_id);
+                CREATE INDEX IF NOT EXISTS idx_provider_stop_tombstones_expiry ON provider_stop_tombstones(expires_at);
                 """
             )
             project_columns = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+            preflight_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(preflight_capacity_reservations)"
+                ).fetchall()
+            }
+            if "heartbeat_at" not in preflight_columns:
+                conn.execute(
+                    "ALTER TABLE preflight_capacity_reservations "
+                    "ADD COLUMN heartbeat_at TEXT NOT NULL DEFAULT ''"
+                )
+                conn.execute(
+                    """
+                    UPDATE preflight_capacity_reservations
+                    SET heartbeat_at = acquired_at
+                    WHERE heartbeat_at = ''
+                    """
+                )
             if "tenant_id" not in project_columns:
                 conn.execute("ALTER TABLE projects ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
             worker_columns = {row["name"] for row in conn.execute("PRAGMA table_info(workers)").fetchall()}
@@ -1748,6 +2556,40 @@ class Store:
                 conn.execute("ALTER TABLE workers ADD COLUMN bootstrap_bundle_json TEXT")
             if "execution_mode" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'docker'")
+            if "trusted_run_lane" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN trusted_run_lane TEXT NOT NULL DEFAULT 'mission'"
+                )
+            if "resource_class" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN resource_class TEXT NOT NULL DEFAULT 'standard'"
+                )
+            if "resource_memory_bytes" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN resource_memory_bytes INTEGER NOT NULL DEFAULT 3221225472"
+                )
+                configured_standard_memory = _worker_resource_values(
+                    "standard",
+                    None,
+                )[1]
+                conn.execute(
+                    "UPDATE workers SET resource_memory_bytes = ?",
+                    (configured_standard_memory,),
+                )
+            # Provider sessions are created only by the trusted conversation
+            # provider. Backfill that durable linkage when upgrading a runtime
+            # whose older workers carried only model-visible bootstrap metadata.
+            cur = conn.execute(
+                """
+                UPDATE workers
+                SET trusted_run_lane = 'conversation'
+                WHERE worker_id IN (SELECT worker_id FROM provider_sessions)
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workers_execution_lane_state "
+                "ON workers(execution_mode, trusted_run_lane, state)"
+            )
             if "alias" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN alias TEXT")
             if "workspace_root" not in worker_columns:
@@ -1762,9 +2604,344 @@ class Store:
                 conn.execute("ALTER TABLE workers ADD COLUMN duplication_report_json TEXT NOT NULL DEFAULT '{}'")
             if "compute_released_at" not in worker_columns:
                 conn.execute("ALTER TABLE workers ADD COLUMN compute_released_at TEXT")
+            if "compute_release_token" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_token TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_owner" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_owner TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_claimed_at" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_claimed_at TEXT"
+                )
+            if "compute_release_expires_at" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_expires_at TEXT"
+                )
+            if "compute_release_epoch" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_epoch INTEGER NOT NULL DEFAULT 0"
+                )
+            if "compute_release_kind" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_kind TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_scope" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_scope TEXT NOT NULL DEFAULT 'compute_only'"
+                )
+            if "compute_release_container_id" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_container_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_session_fingerprint" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_session_fingerprint TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_target_run_id" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_target_run_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_target_started_at" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_target_started_at TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_terminal_run_id" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_terminal_run_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_replacement_run_id" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_replacement_run_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_runtime_confirmed_at" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_runtime_confirmed_at TEXT"
+                )
+            if "compute_release_runtime_proof_digest" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_runtime_proof_digest TEXT NOT NULL DEFAULT ''"
+                )
+            if "compute_release_operation_id" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN compute_release_operation_id TEXT NOT NULL DEFAULT ''"
+                )
+                conn.execute(
+                    """
+                    UPDATE workers
+                    SET compute_release_operation_id = 'op_legacy_' || lower(hex(randomblob(16)))
+                    WHERE compute_release_token != ''
+                      AND compute_release_operation_id = ''
+                    """
+                )
+            if "work_stop_id" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN work_stop_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "work_stop_requested_at" not in worker_columns:
+                conn.execute("ALTER TABLE workers ADD COLUMN work_stop_requested_at TEXT")
+            if "work_stop_settled_at" not in worker_columns:
+                conn.execute("ALTER TABLE workers ADD COLUMN work_stop_settled_at TEXT")
+            if "work_stop_outcome" not in worker_columns:
+                conn.execute(
+                    "ALTER TABLE workers ADD COLUMN work_stop_outcome TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """
+                UPDATE workers
+                SET compute_release_scope = CASE compute_release_kind
+                        WHEN 'max_duration' THEN 'run'
+                        WHEN 'pause_run' THEN 'run'
+                        WHEN 'resume_run' THEN 'run'
+                        WHEN 'interrupt_run' THEN 'run'
+                        WHEN 'steer_run' THEN 'run'
+                        WHEN 'stop_run' THEN 'work'
+                        WHEN 'terminate_worker' THEN 'worker'
+                        ELSE 'compute_only'
+                    END,
+                    work_stop_id = CASE
+                        WHEN compute_release_kind = 'stop_run'
+                          AND compute_release_token != ''
+                          AND work_stop_id = ''
+                        THEN compute_release_token ELSE work_stop_id END,
+                    work_stop_requested_at = CASE
+                        WHEN compute_release_kind = 'stop_run'
+                          AND compute_release_token != ''
+                          AND work_stop_requested_at IS NULL
+                        THEN COALESCE(compute_release_claimed_at, updated_at)
+                        ELSE work_stop_requested_at END
+                WHERE (
+                    compute_release_token != ''
+                    AND compute_release_kind IN (
+                        'idle', 'paused', 'pause_worker', 'resume_worker',
+                        'max_duration', 'pause_run', 'resume_run', 'interrupt_run',
+                        'steer_run', 'stop_run', 'terminate_worker'
+                    )
+                    AND compute_release_scope != CASE compute_release_kind
+                        WHEN 'max_duration' THEN 'run'
+                        WHEN 'pause_run' THEN 'run'
+                        WHEN 'resume_run' THEN 'run'
+                        WHEN 'interrupt_run' THEN 'run'
+                        WHEN 'steer_run' THEN 'run'
+                        WHEN 'stop_run' THEN 'work'
+                        WHEN 'terminate_worker' THEN 'worker'
+                        ELSE 'compute_only'
+                    END
+                )
+                   OR compute_release_scope NOT IN ('compute_only', 'run', 'work', 'worker')
+                   OR (compute_release_kind = 'stop_run' AND compute_release_token != '')
+                """
+            )
+            lifecycle_effect_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(lifecycle_operation_effects)"
+                ).fetchall()
+            }
+            if "lease_epoch" not in lifecycle_effect_columns:
+                conn.execute(
+                    "ALTER TABLE lifecycle_operation_effects "
+                    "ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0"
+                )
+            if "next_attempt_at" not in lifecycle_effect_columns:
+                conn.execute(
+                    "ALTER TABLE lifecycle_operation_effects "
+                    "ADD COLUMN next_attempt_at TEXT"
+                )
+            capability_revocation_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(capability_grant_revocations)"
+                ).fetchall()
+            }
+            if "host_startup_lease_id" not in capability_revocation_columns:
+                conn.execute(
+                    "ALTER TABLE capability_grant_revocations "
+                    "ADD COLUMN host_startup_lease_id TEXT NOT NULL DEFAULT ''"
+                )
+            lifecycle_effect_sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'lifecycle_operation_effects'"
+            ).fetchone()
+            compact_effect_sql = "".join(
+                str((lifecycle_effect_sql_row or {"sql": ""})["sql"] or "")
+                .lower()
+                .split()
+            )
+            full_effect_identity = (
+                "unique(operation_digest,operation_epoch,operation_kind,"
+                "effect_kind,worker_id,run_id)"
+            )
+            legacy_effect_table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'lifecycle_operation_effects_legacy_identity'"
+            ).fetchone() is not None
+            if (
+                full_effect_identity not in compact_effect_sql
+                or legacy_effect_table_exists
+            ):
+                effect_columns_sql = """
+                    effect_id, operation_digest, operation_epoch, operation_kind,
+                    effect_kind, worker_id, run_id, status, lease_owner,
+                    lease_epoch, lease_expires_at, next_attempt_at, attempts,
+                    last_error_code, created_at, updated_at, applied_at
+                """
+
+                def merge_effect_rows(source_table: str, target_table: str) -> None:
+                    source_columns = {
+                        row["name"]
+                        for row in conn.execute(
+                            f"PRAGMA table_info({source_table})"
+                        ).fetchall()
+                    }
+                    source_next_attempt = (
+                        "next_attempt_at"
+                        if "next_attempt_at" in source_columns
+                        else "NULL AS next_attempt_at"
+                    )
+                    source_columns_sql = f"""
+                        effect_id, operation_digest, operation_epoch,
+                        operation_kind, effect_kind, worker_id, run_id, status,
+                        lease_owner, lease_epoch, lease_expires_at,
+                        {source_next_attempt}, attempts, last_error_code,
+                        created_at, updated_at, applied_at
+                    """
+                    conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO {target_table} ({effect_columns_sql})
+                        SELECT {source_columns_sql} FROM {source_table}
+                        """
+                    )
+                    next_attempt_match = (
+                        "target.next_attempt_at IS source.next_attempt_at"
+                        if "next_attempt_at" in source_columns
+                        else "target.next_attempt_at IS NULL"
+                    )
+                    mismatched = conn.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {source_table} AS source
+                        LEFT JOIN {target_table} AS target
+                          ON target.effect_id = source.effect_id
+                        WHERE target.effect_id IS NULL
+                           OR NOT (
+                                target.operation_digest IS source.operation_digest
+                            AND target.operation_epoch IS source.operation_epoch
+                            AND target.operation_kind IS source.operation_kind
+                            AND target.effect_kind IS source.effect_kind
+                            AND target.worker_id IS source.worker_id
+                            AND target.run_id IS source.run_id
+                            AND target.status IS source.status
+                            AND target.lease_owner IS source.lease_owner
+                            AND target.lease_epoch IS source.lease_epoch
+                            AND target.lease_expires_at IS source.lease_expires_at
+                            AND {next_attempt_match}
+                            AND target.attempts IS source.attempts
+                            AND target.last_error_code IS source.last_error_code
+                            AND target.created_at IS source.created_at
+                            AND target.updated_at IS source.updated_at
+                            AND target.applied_at IS source.applied_at
+                           )
+                        """
+                    ).fetchone()[0]
+                    if int(mismatched or 0):
+                        raise RuntimeError(
+                            "Lifecycle effect identity migration could not preserve every row"
+                        )
+
+                conn.execute("SAVEPOINT lifecycle_effect_identity_migration")
+                try:
+                    if full_effect_identity not in compact_effect_sql:
+                        build_table = "lifecycle_operation_effects_full_identity"
+                        conn.execute(
+                            f"DROP TABLE IF EXISTS {build_table}"
+                        )
+                        conn.execute(
+                            f"""
+                            CREATE TABLE {build_table} (
+                                effect_id TEXT PRIMARY KEY,
+                                operation_digest TEXT NOT NULL,
+                                operation_epoch INTEGER NOT NULL,
+                                operation_kind TEXT NOT NULL,
+                                effect_kind TEXT NOT NULL,
+                                worker_id TEXT NOT NULL,
+                                run_id TEXT NOT NULL DEFAULT '',
+                                status TEXT NOT NULL DEFAULT 'pending',
+                                lease_owner TEXT NOT NULL DEFAULT '',
+                                lease_epoch INTEGER NOT NULL DEFAULT 0,
+                                lease_expires_at TEXT,
+                                next_attempt_at TEXT,
+                                attempts INTEGER NOT NULL DEFAULT 0,
+                                last_error_code TEXT NOT NULL DEFAULT '',
+                                created_at TEXT NOT NULL,
+                                updated_at TEXT NOT NULL,
+                                applied_at TEXT,
+                                UNIQUE(
+                                    operation_digest, operation_epoch,
+                                    operation_kind, effect_kind, worker_id, run_id
+                                ),
+                                FOREIGN KEY(worker_id) REFERENCES workers(worker_id)
+                            )
+                            """
+                        )
+                        merge_effect_rows(
+                            "lifecycle_operation_effects", build_table
+                        )
+                        if legacy_effect_table_exists:
+                            merge_effect_rows(
+                                "lifecycle_operation_effects_legacy_identity",
+                                build_table,
+                            )
+                        conn.execute(
+                            "DROP INDEX IF EXISTS idx_lifecycle_effects_status_lease"
+                        )
+                        conn.execute("DROP TABLE lifecycle_operation_effects")
+                        if legacy_effect_table_exists:
+                            conn.execute(
+                                "DROP TABLE lifecycle_operation_effects_legacy_identity"
+                            )
+                        conn.execute(
+                            f"ALTER TABLE {build_table} "
+                            "RENAME TO lifecycle_operation_effects"
+                        )
+                    elif legacy_effect_table_exists:
+                        merge_effect_rows(
+                            "lifecycle_operation_effects_legacy_identity",
+                            "lifecycle_operation_effects",
+                        )
+                        conn.execute(
+                            "DROP TABLE lifecycle_operation_effects_legacy_identity"
+                        )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_lifecycle_effects_status_lease "
+                        "ON lifecycle_operation_effects("
+                        "status, lease_expires_at, created_at)"
+                    )
+                    conn.execute("RELEASE lifecycle_effect_identity_migration")
+                except Exception:
+                    conn.execute(
+                        "ROLLBACK TO lifecycle_effect_identity_migration"
+                    )
+                    conn.execute("RELEASE lifecycle_effect_identity_migration")
+                    raise
+            final_lifecycle_effect_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(lifecycle_operation_effects)"
+                ).fetchall()
+            }
+            if "next_attempt_at" not in final_lifecycle_effect_columns:
+                conn.execute(
+                    "ALTER TABLE lifecycle_operation_effects "
+                    "ADD COLUMN next_attempt_at TEXT"
+                )
             gc_columns = {
                 row["name"]
-                for row in conn.execute("PRAGMA table_info(workspace_gc_tombstones)").fetchall()
+                for row in conn.execute(
+                    "PRAGMA table_info(workspace_gc_tombstones)"
+                ).fetchall()
             }
             for column, definition in {
                 "state_dir": "TEXT NOT NULL DEFAULT ''",
@@ -1772,7 +2949,10 @@ class Store:
                 "workspace_root": "TEXT NOT NULL DEFAULT ''",
             }.items():
                 if column not in gc_columns:
-                    conn.execute(f"ALTER TABLE workspace_gc_tombstones ADD COLUMN {column} {definition}")
+                    conn.execute(
+                        f"ALTER TABLE workspace_gc_tombstones "
+                        f"ADD COLUMN {column} {definition}"
+                    )
             run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
             if "tenant_id" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
@@ -1780,6 +2960,8 @@ class Store:
                 conn.execute("ALTER TABLE runs ADD COLUMN failure_class TEXT NOT NULL DEFAULT ''")
             if "failure_retryable" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN failure_retryable INTEGER NOT NULL DEFAULT 0")
+            if "failure_structured" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN failure_structured INTEGER NOT NULL DEFAULT 0")
             if "failure_user_message" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN failure_user_message TEXT NOT NULL DEFAULT ''")
             if "failure_recommended_recovery" not in run_columns:
@@ -1792,20 +2974,684 @@ class Store:
                 conn.execute("ALTER TABLE runs ADD COLUMN retry_after TEXT")
             if "retry_attempts" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN retry_attempts INTEGER NOT NULL DEFAULT 0")
+            if "capacity_retry_count" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN capacity_retry_count INTEGER NOT NULL DEFAULT 0"
+                )
             if "last_retry_class" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN last_retry_class TEXT NOT NULL DEFAULT ''")
-            for token_field in _TOKEN_USAGE_FIELD_NAMES:
-                if token_field not in run_columns:
-                    conn.execute(f"ALTER TABLE runs ADD COLUMN {token_field} INTEGER NOT NULL DEFAULT 0")
+            for usage_column in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ):
+                if usage_column not in run_columns:
+                    conn.execute(
+                        f"ALTER TABLE runs ADD COLUMN {usage_column} INTEGER NOT NULL DEFAULT 0"
+                    )
+            if "native_session_id" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN native_session_id TEXT NOT NULL DEFAULT ''")
+            if "native_capabilities_json" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN native_capabilities_json TEXT NOT NULL DEFAULT '{}'")
+            if "native_child_summary_json" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN native_child_summary_json TEXT NOT NULL DEFAULT '{}'")
+            if "liveness_started_at" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN liveness_started_at TEXT")
+            if "meaningful_progress_at" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN meaningful_progress_at TEXT")
+            if "meaningful_progress_sequence" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN meaningful_progress_sequence "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "internal_retry_count" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN internal_retry_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "last_internal_retry_class" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN last_internal_retry_class "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            if "liveness_mode" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN liveness_mode "
+                    "TEXT NOT NULL DEFAULT 'standard'"
+                )
+            if "provider_liveness_route_locked" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN provider_liveness_route_locked "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            provider_liveness_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(provider_liveness_events)"
+                ).fetchall()
+            }
+            if "source_sequence" not in provider_liveness_columns:
+                conn.execute(
+                    "ALTER TABLE provider_liveness_events ADD COLUMN "
+                    "source_sequence INTEGER NOT NULL DEFAULT 0"
+                )
+            if "source_digest" not in provider_liveness_columns:
+                conn.execute(
+                    "ALTER TABLE provider_liveness_events ADD COLUMN "
+                    "source_digest TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_provider_liveness_attempt_sequence "
+                "ON provider_liveness_events(run_id, attempt_id, source_sequence) "
+                "WHERE source_sequence > 0"
+            )
+            if "runtime_invoked_at" not in run_columns:
+                conn.execute("ALTER TABLE runs ADD COLUMN runtime_invoked_at TEXT")
+            for column_name, definition in (
+                ("first_queued_at", "TEXT"),
+                ("queue_deadline_at", "TEXT"),
+                ("queue_blocker_class", "TEXT NOT NULL DEFAULT 'admission_pending'"),
+                ("queue_next_status_at", "TEXT"),
+                ("queue_wait_episode", "INTEGER NOT NULL DEFAULT 1"),
+                ("queue_wait_open", "INTEGER NOT NULL DEFAULT 1"),
+                ("queue_wait_generation", "INTEGER NOT NULL DEFAULT 1"),
+                ("queue_wait_started_at", "TEXT"),
+                ("queue_wait_closed_at", "TEXT"),
+                ("queue_wait_duration_seconds", "INTEGER"),
+                ("queue_transition_emitted", "INTEGER NOT NULL DEFAULT 0"),
+                ("queue_status_sequence", "INTEGER NOT NULL DEFAULT 0"),
+                ("queue_callback_state", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("queue_terminal_callback_id", "TEXT NOT NULL DEFAULT ''"),
+                ("claimed_at", "TEXT"),
+                ("admitted_at", "TEXT"),
+                ("active_attempt_id", "TEXT NOT NULL DEFAULT ''"),
+                ("terminal_result_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("capacity_class", "TEXT NOT NULL DEFAULT ''"),
+                ("capacity_available_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("capacity_required_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("capacity_shortage_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("capacity_reservation_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("capacity_next_retry_at", "TEXT"),
+                ("provider_route_profile", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_runtime", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_model", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_decision", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_from_profile", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_from_runtime", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_from_model", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_failure_class", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_route_cooldown_until", "TEXT"),
+                ("continuation_contract_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("continuation_context_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if column_name not in run_columns:
+                    conn.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column_name} {definition}"
+                    )
+            conn.execute(
+                """
+                UPDATE runs
+                SET terminal_result_revision = 1
+                WHERE state IN ('completed', 'failed', 'cancelled', 'interrupted')
+                  AND terminal_result_revision < 1
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_result_revision_insert
+                AFTER INSERT ON runs
+                WHEN NEW.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+                 AND NEW.terminal_result_revision < 1
+                BEGIN
+                    UPDATE runs
+                    SET terminal_result_revision = 1
+                    WHERE run_id = NEW.run_id;
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_result_revision_update
+                AFTER UPDATE OF
+                    state, ended_at, active_attempt_id, output_text, error_text,
+                    failure_class, failure_retryable, failure_structured,
+                    failure_user_message, failure_recommended_recovery,
+                    failure_diagnostic_summary
+                ON runs
+                WHEN NEW.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+                 AND (
+                    OLD.state NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                    OR OLD.state IS NOT NEW.state
+                    OR OLD.ended_at IS NOT NEW.ended_at
+                    OR OLD.active_attempt_id IS NOT NEW.active_attempt_id
+                    OR OLD.output_text IS NOT NEW.output_text
+                    OR OLD.error_text IS NOT NEW.error_text
+                    OR OLD.failure_class IS NOT NEW.failure_class
+                    OR OLD.failure_retryable IS NOT NEW.failure_retryable
+                    OR OLD.failure_structured IS NOT NEW.failure_structured
+                    OR OLD.failure_user_message IS NOT NEW.failure_user_message
+                    OR OLD.failure_recommended_recovery
+                        IS NOT NEW.failure_recommended_recovery
+                    OR OLD.failure_diagnostic_summary
+                        IS NOT NEW.failure_diagnostic_summary
+                 )
+                BEGIN
+                    UPDATE runs
+                    SET terminal_result_revision = CASE
+                        WHEN OLD.terminal_result_revision < 1 THEN 1
+                        ELSE OLD.terminal_result_revision + 1
+                    END
+                    WHERE run_id = NEW.run_id;
+                END
+                """
+            )
+            legacy_queue_rows = conn.execute(
+                """
+                SELECT run_id, queued_at
+                FROM runs
+                WHERE first_queued_at IS NULL OR first_queued_at = ''
+                   OR queue_deadline_at IS NULL OR queue_deadline_at = ''
+                """
+            ).fetchall()
+            for legacy_run in legacy_queue_rows:
+                defaults = _queue_defaults(
+                    str(legacy_run["queued_at"]), run_id=str(legacy_run["run_id"])
+                )
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET first_queued_at = COALESCE(NULLIF(first_queued_at, ''), ?),
+                        queue_deadline_at = COALESCE(NULLIF(queue_deadline_at, ''), ?),
+                        queue_next_status_at = COALESCE(queue_next_status_at, ?),
+                        queue_wait_started_at = COALESCE(
+                            NULLIF(queue_wait_started_at, ''),
+                            NULLIF(first_queued_at, ''), ?
+                        ),
+                        queue_terminal_callback_id = COALESCE(
+                            NULLIF(queue_terminal_callback_id, ''), ?
+                        )
+                    WHERE run_id = ?
+                    """,
+                    (
+                        defaults["first_queued_at"],
+                        defaults["queue_deadline_at"],
+                        defaults["queue_next_status_at"],
+                        defaults["queue_wait_started_at"],
+                        defaults["queue_terminal_callback_id"],
+                        legacy_run["run_id"],
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE runs
+                SET queue_wait_generation = MAX(1, queue_wait_episode),
+                    queue_wait_started_at = COALESCE(
+                        NULLIF(queue_wait_started_at, ''), first_queued_at, queued_at
+                    ),
+                    queue_wait_open = CASE
+                        WHEN state IN ('queued', 'claimed', 'admitted')
+                             AND runtime_invoked_at IS NULL THEN 1 ELSE 0 END,
+                    queue_wait_closed_at = CASE
+                        WHEN state IN ('queued', 'claimed', 'admitted')
+                             AND runtime_invoked_at IS NULL THEN NULL
+                        ELSE COALESCE(
+                            queue_wait_closed_at, runtime_invoked_at, ended_at, started_at
+                        ) END,
+                    queue_next_status_at = CASE
+                        WHEN state IN ('queued', 'claimed', 'admitted')
+                             AND runtime_invoked_at IS NULL THEN queue_next_status_at
+                        ELSE NULL END
+                WHERE queue_wait_started_at IS NULL OR queue_wait_started_at = ''
+                   OR queue_wait_generation IS NULL OR queue_wait_generation < 1
+                   OR (queue_wait_open = 1 AND (
+                       runtime_invoked_at IS NOT NULL
+                       OR state NOT IN ('queued', 'claimed', 'admitted')
+                   ))
+                """
+            )
+            queue_identity_rows = conn.execute(
+                """
+                SELECT run_id, queued_at, first_queued_at, queue_deadline_at,
+                       queue_wait_generation, queue_wait_started_at,
+                       queue_wait_closed_at, queue_wait_duration_seconds,
+                       queue_terminal_callback_id
+                FROM runs
+                WHERE queue_terminal_callback_id IS NULL
+                   OR queue_terminal_callback_id = ''
+                   OR (
+                       queue_wait_open = 0
+                       AND queue_wait_duration_seconds IS NULL
+                       AND queue_wait_closed_at IS NOT NULL
+                   )
+                """
+            ).fetchall()
+            for queue_row in queue_identity_rows:
+                generation = max(1, int(queue_row["queue_wait_generation"] or 1))
+                started_at = str(
+                    queue_row["queue_wait_started_at"]
+                    or queue_row["first_queued_at"]
+                    or queue_row["queued_at"]
+                )
+                deadline = str(queue_row["queue_deadline_at"] or "")
+                if not deadline:
+                    deadline = (
+                        _parse_utc(started_at)
+                        + timedelta(seconds=_queue_wait_timeout_seconds())
+                    ).isoformat()
+                duration = queue_row["queue_wait_duration_seconds"]
+                closed_at = str(queue_row["queue_wait_closed_at"] or "")
+                if duration is None and closed_at:
+                    duration = max(
+                        0,
+                        int(
+                            (
+                                _parse_utc(closed_at) - _parse_utc(started_at)
+                            ).total_seconds()
+                        ),
+                    )
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET queue_deadline_at = ?,
+                        queue_terminal_callback_id = ?,
+                        queue_wait_duration_seconds = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        deadline,
+                        _queue_callback_id(
+                            "timeout",
+                            run_id=str(queue_row["run_id"]),
+                            generation=generation,
+                            deadline=deadline,
+                        ),
+                        duration,
+                        str(queue_row["run_id"]),
+                    ),
+                )
+            run_attempt_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(run_attempts)").fetchall()
+            }
+            if "capacity_class" not in run_attempt_columns:
+                conn.execute(
+                    "ALTER TABLE run_attempts ADD COLUMN capacity_class TEXT NOT NULL DEFAULT ''"
+                )
+            if "provider_health_observed_last_failed_at" not in run_attempt_columns:
+                conn.execute(
+                    "ALTER TABLE run_attempts ADD COLUMN "
+                    "provider_health_observed_last_failed_at TEXT"
+                )
+            if "provider_health_observed_generation" not in run_attempt_columns:
+                conn.execute(
+                    "ALTER TABLE run_attempts ADD COLUMN "
+                    "provider_health_observed_generation INTEGER"
+                )
+            provider_health_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(provider_route_health)"
+                ).fetchall()
+            }
+            if "failure_generation" not in provider_health_columns:
+                conn.execute(
+                    "ALTER TABLE provider_route_health ADD COLUMN "
+                    "failure_generation INTEGER NOT NULL DEFAULT 1"
+                )
+            host_lease_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(host_run_leases)").fetchall()
+            }
+            if "mutation_scope" not in host_lease_columns:
+                conn.execute(
+                    "ALTER TABLE host_run_leases ADD COLUMN mutation_scope TEXT NOT NULL DEFAULT ''"
+                )
+            for column_name, definition in (
+                ("startup_token", "TEXT NOT NULL DEFAULT ''"),
+                ("startup_state", "TEXT NOT NULL DEFAULT 'legacy_unknown'"),
+                ("startup_confirmed_at", "TEXT"),
+                ("startup_identity_kind", "TEXT NOT NULL DEFAULT ''"),
+                ("startup_container_id", "TEXT NOT NULL DEFAULT ''"),
+                ("startup_session_id", "TEXT NOT NULL DEFAULT ''"),
+                ("attempt_id", "TEXT NOT NULL DEFAULT ''"),
+                ("reserved_child_processes", "INTEGER NOT NULL DEFAULT 0"),
+                ("reserved_threads", "INTEGER NOT NULL DEFAULT 0"),
+                ("reserved_memory_bytes", "INTEGER NOT NULL DEFAULT 0"),
+                ("reserved_disk_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column_name not in host_lease_columns:
+                    conn.execute(
+                        f"ALTER TABLE host_run_leases ADD COLUMN {column_name} {definition}"
+                    )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_host_run_leases_active_mutation_scope "
+                "ON host_run_leases(status, mutation_scope)"
+            )
             event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
             if "tenant_id" not in event_columns:
                 conn.execute("ALTER TABLE events ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
+            if "payload_json" not in event_columns:
+                conn.execute("ALTER TABLE events ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'")
             callback_columns = {row["name"] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
             if "tenant_id" not in callback_columns:
                 conn.execute("ALTER TABLE callback_outbox ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'")
+            if "http_accepted_at" not in callback_columns:
+                conn.execute("ALTER TABLE callback_outbox ADD COLUMN http_accepted_at TEXT")
+            for column_name, definition in (
+                ("attempt_number", "INTEGER NOT NULL DEFAULT 0"),
+                ("result_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("result_digest", "TEXT NOT NULL DEFAULT ''"),
+                ("delivery_lease_token", "TEXT NOT NULL DEFAULT ''"),
+                ("delivery_generation", "INTEGER NOT NULL DEFAULT 0"),
+                ("delivery_lease_expires_at", "TEXT"),
+            ):
+                if column_name not in callback_columns:
+                    conn.execute(
+                        f"ALTER TABLE callback_outbox ADD COLUMN {column_name} {definition}"
+                    )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_callback_outbox_terminal_result "
+                "ON callback_outbox(run_id, event_type, attempt_number, result_digest)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_callback_outbox_terminal_revision "
+                "ON callback_outbox(run_id, event_type, attempt_number, "
+                "result_revision, result_digest)"
+            )
+            conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS callback_outbox_authority_immutable
+                BEFORE UPDATE ON callback_outbox
+                WHEN OLD.callback_id IS NOT NEW.callback_id
+                  OR OLD.project_id IS NOT NEW.project_id
+                  OR OLD.worker_id IS NOT NEW.worker_id
+                  OR OLD.tenant_id IS NOT NEW.tenant_id
+                  OR OLD.run_id IS NOT NEW.run_id
+                  OR OLD.attempt_number IS NOT NEW.attempt_number
+                  OR OLD.event_type IS NOT NEW.event_type
+                  OR OLD.url IS NOT NEW.url
+                  OR OLD.result_revision IS NOT NEW.result_revision
+                  OR OLD.result_digest IS NOT NEW.result_digest
+                  OR OLD.created_at IS NOT NEW.created_at
+                BEGIN
+                    SELECT RAISE(ABORT, 'callback authority is immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS callback_outbox_delete_forbidden
+                BEFORE DELETE ON callback_outbox
+                BEGIN
+                    SELECT RAISE(ABORT, 'callback authority is immutable');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS callback_outbox_trace_insert
+                AFTER INSERT ON callback_outbox
+                BEGIN
+                    INSERT INTO callback_trace_events (
+                        callback_id, run_id, callback_sequence, run_sequence,
+                        mutation_kind, status, snapshot_json, payload_sha256,
+                        authority_sha256, previous_event_sha256, event_sha256,
+                        created_at
+                    )
+                    SELECT
+                        callback_id, run_id, callback_sequence, run_sequence,
+                        'insert', status, snapshot_json, payload_sha256,
+                        authority_sha256, previous_event_sha256,
+                        glasshive_callback_trace_sha256(
+                            callback_id, callback_sequence, run_sequence,
+                            snapshot_json, previous_event_sha256
+                        ),
+                        observed_at
+                    FROM (
+                        SELECT
+                            NEW.callback_id AS callback_id,
+                            NEW.run_id AS run_id,
+                            COALESCE((
+                                SELECT MAX(callback_sequence)
+                                FROM callback_trace_events
+                                WHERE callback_id = NEW.callback_id
+                            ), 0) + 1 AS callback_sequence,
+                            COALESCE((
+                                SELECT MAX(run_sequence)
+                                FROM callback_trace_events
+                                WHERE run_id = NEW.run_id
+                            ), 0) + 1 AS run_sequence,
+                            NEW.status AS status,
+                            glasshive_callback_trace_snapshot(
+                                NEW.callback_id, NEW.project_id, NEW.worker_id,
+                                NEW.tenant_id, NEW.run_id, NEW.attempt_number,
+                                NEW.event_type, NEW.url, NEW.payload_json,
+                                NEW.result_revision, NEW.result_digest,
+                                NEW.status, NEW.attempts, NEW.last_error,
+                                NEW.created_at, NEW.updated_at, NEW.delivered_at,
+                                NEW.http_accepted_at, NEW.delivery_lease_token,
+                                NEW.delivery_generation,
+                                NEW.delivery_lease_expires_at
+                            ) AS snapshot_json,
+                            'sha256:' || glasshive_sha256(NEW.payload_json)
+                                AS payload_sha256,
+                            'sha256:' || glasshive_sha256(
+                                glasshive_callback_trace_authority(
+                                    NEW.callback_id, NEW.project_id,
+                                    NEW.worker_id, NEW.tenant_id, NEW.run_id,
+                                    NEW.attempt_number, NEW.event_type, NEW.url,
+                                    NEW.result_revision, NEW.result_digest,
+                                    NEW.delivery_lease_token,
+                                    NEW.delivery_generation,
+                                    NEW.delivery_lease_expires_at
+                                )
+                            ) AS authority_sha256,
+                            COALESCE((
+                                SELECT event_sha256
+                                FROM callback_trace_events
+                                WHERE run_id = NEW.run_id
+                                ORDER BY run_sequence DESC LIMIT 1
+                            ), '') AS previous_event_sha256,
+                            COALESCE(NEW.updated_at, NEW.created_at, CURRENT_TIMESTAMP)
+                                AS observed_at
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS callback_outbox_trace_update
+                AFTER UPDATE ON callback_outbox
+                BEGIN
+                    INSERT INTO callback_trace_events (
+                        callback_id, run_id, callback_sequence, run_sequence,
+                        mutation_kind, status, snapshot_json, payload_sha256,
+                        authority_sha256, previous_event_sha256, event_sha256,
+                        created_at
+                    )
+                    SELECT
+                        callback_id, run_id, callback_sequence, run_sequence,
+                        'update', status, snapshot_json, payload_sha256,
+                        authority_sha256, previous_event_sha256,
+                        glasshive_callback_trace_sha256(
+                            callback_id, callback_sequence, run_sequence,
+                            snapshot_json, previous_event_sha256
+                        ),
+                        observed_at
+                    FROM (
+                        SELECT
+                            NEW.callback_id AS callback_id,
+                            NEW.run_id AS run_id,
+                            COALESCE((
+                                SELECT MAX(callback_sequence)
+                                FROM callback_trace_events
+                                WHERE callback_id = NEW.callback_id
+                            ), 0) + 1 AS callback_sequence,
+                            COALESCE((
+                                SELECT MAX(run_sequence)
+                                FROM callback_trace_events
+                                WHERE run_id = NEW.run_id
+                            ), 0) + 1 AS run_sequence,
+                            NEW.status AS status,
+                            glasshive_callback_trace_snapshot(
+                                NEW.callback_id, NEW.project_id, NEW.worker_id,
+                                NEW.tenant_id, NEW.run_id, NEW.attempt_number,
+                                NEW.event_type, NEW.url, NEW.payload_json,
+                                NEW.result_revision, NEW.result_digest,
+                                NEW.status, NEW.attempts, NEW.last_error,
+                                NEW.created_at, NEW.updated_at, NEW.delivered_at,
+                                NEW.http_accepted_at, NEW.delivery_lease_token,
+                                NEW.delivery_generation,
+                                NEW.delivery_lease_expires_at
+                            ) AS snapshot_json,
+                            'sha256:' || glasshive_sha256(NEW.payload_json)
+                                AS payload_sha256,
+                            'sha256:' || glasshive_sha256(
+                                glasshive_callback_trace_authority(
+                                    NEW.callback_id, NEW.project_id,
+                                    NEW.worker_id, NEW.tenant_id, NEW.run_id,
+                                    NEW.attempt_number, NEW.event_type, NEW.url,
+                                    NEW.result_revision, NEW.result_digest,
+                                    NEW.delivery_lease_token,
+                                    NEW.delivery_generation,
+                                    NEW.delivery_lease_expires_at
+                                )
+                            ) AS authority_sha256,
+                            COALESCE((
+                                SELECT event_sha256
+                                FROM callback_trace_events
+                                WHERE run_id = NEW.run_id
+                                ORDER BY run_sequence DESC LIMIT 1
+                            ), '') AS previous_event_sha256,
+                            COALESCE(NEW.updated_at, NEW.created_at, CURRENT_TIMESTAMP)
+                                AS observed_at
+                    );
+                END;
+
+                UPDATE callback_outbox
+                SET updated_at = updated_at
+                WHERE run_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM callback_trace_events
+                      WHERE callback_trace_events.callback_id = callback_outbox.callback_id
+                  );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_terminal_callback_result_attempts "
+                "ON terminal_callback_result_attempts("
+                "receiver_scope, run_id, attempt_id)"
+            )
+            delegation_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(delegations)").fetchall()
+            }
+            if "dismissed_at" not in delegation_columns:
+                conn.execute("ALTER TABLE delegations ADD COLUMN dismissed_at TEXT")
+            if "origin_ref" not in delegation_columns:
+                conn.execute(
+                    "ALTER TABLE delegations ADD COLUMN origin_ref TEXT NOT NULL DEFAULT ''"
+                )
+            active_work_action_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(active_work_action_uses)"
+                ).fetchall()
+            }
+            if "source_run_id" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses "
+                    "ADD COLUMN source_run_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "effect_phase" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses "
+                    "ADD COLUMN effect_phase TEXT NOT NULL DEFAULT ''"
+                )
+            if "lifecycle_operation_id" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses "
+                    "ADD COLUMN lifecycle_operation_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "lifecycle_operation_kind" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses "
+                    "ADD COLUMN lifecycle_operation_kind TEXT NOT NULL DEFAULT ''"
+                )
+            if "lifecycle_target_run_id" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses "
+                    "ADD COLUMN lifecycle_target_run_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "executor_id" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses "
+                    "ADD COLUMN executor_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "lease_expires_at" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses ADD COLUMN lease_expires_at TEXT"
+                )
+            if "source_context_json" not in active_work_action_columns:
+                conn.execute(
+                    "ALTER TABLE active_work_action_uses "
+                    "ADD COLUMN source_context_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_delegations_owner_origin_ref "
+                "ON delegations(tenant_id, owner_id, origin_ref) WHERE origin_ref <> ''"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_delegations_owner_active_order "
+                "ON delegations(tenant_id, owner_id, dismissed_at, "
+                "updated_at DESC, created_at DESC, work_ref DESC)"
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_tenant_owner ON projects(tenant_id, owner_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workers_tenant_owner ON workers(tenant_id, owner_id, project_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_tenant_project ON runs(tenant_id, project_id, queued_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_state_retry_after_worker "
+                "ON runs(state, retry_after, worker_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_queue_status_due "
+                "ON runs(queue_wait_open, state, queue_next_status_at, queue_deadline_at)"
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_runs_terminal_lifecycle_fence
+                AFTER UPDATE OF state ON runs
+                WHEN NEW.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+                 AND OLD.state NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                BEGIN
+                    UPDATE host_run_leases
+                    SET status = 'released',
+                        released_at = COALESCE(NEW.ended_at, CURRENT_TIMESTAMP),
+                        release_reason = 'run_terminal:' || CASE
+                            WHEN NEW.failure_class <> '' THEN NEW.failure_class
+                            ELSE NEW.state
+                        END,
+                        reconciled_at = COALESCE(
+                            reconciled_at, COALESCE(NEW.ended_at, CURRENT_TIMESTAMP)
+                        )
+                    WHERE run_id = NEW.run_id AND status = 'active';
+                    UPDATE runs
+                    SET queue_wait_open = 0,
+                        queue_wait_closed_at = COALESCE(
+                            queue_wait_closed_at, NEW.ended_at, CURRENT_TIMESTAMP
+                        ),
+                        queue_wait_duration_seconds = COALESCE(
+                            queue_wait_duration_seconds,
+                            MAX(
+                                0,
+                                CAST(
+                                    (
+                                        julianday(COALESCE(NEW.ended_at, CURRENT_TIMESTAMP))
+                                        - julianday(COALESCE(
+                                            NEW.queue_wait_started_at,
+                                            NEW.first_queued_at,
+                                            NEW.queued_at
+                                        ))
+                                    ) * 86400 AS INTEGER
+                                )
+                            )
+                        ),
+                        queue_next_status_at = NULL
+                    WHERE run_id = NEW.run_id AND queue_wait_open = 1;
+                END
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_tenant_project ON events(tenant_id, project_id, created_at)")
             schedule_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scheduled_runs)").fetchall()}
             if "owner_id" not in schedule_columns:
@@ -1863,42 +3709,602 @@ class Store:
                 conn.execute("ALTER TABLE user_preferences ADD COLUMN claude_effort TEXT NOT NULL DEFAULT ''")
             if "openclaw_effort" not in preferences_columns:
                 conn.execute("ALTER TABLE user_preferences ADD COLUMN openclaw_effort TEXT NOT NULL DEFAULT ''")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_workers_workspace_catalog "
-                "ON workers(tenant_id, owner_id, workspace_kind, favorite DESC, updated_at DESC, worker_id DESC)"
-            )
-            ensure_parallel_orchestration_schema(conn)
-            provider_columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(provider_requests)")
+            provider_request_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(provider_requests)").fetchall()
             }
-            for column in ("native_invocation_id", "native_body_sha256"):
-                if column not in provider_columns:
+            for column_name in (
+                "fallback_model_id",
+                "fallback_reasoning_effort",
+                "fallback_instruction",
+                "fallback_state",
+                "fallback_from_run_id",
+                "response_deadline_at",
+                "replay_decision_json",
+                "admitted_instruction",
+            ):
+                if column_name not in provider_request_columns:
+                    default_value = "{}" if column_name == "replay_decision_json" else ""
                     conn.execute(
-                        f"ALTER TABLE provider_requests ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                        "ALTER TABLE provider_requests "
+                        f"ADD COLUMN {column_name} TEXT NOT NULL DEFAULT '{default_value}'"
+                    )
+            if "response_timeout_s" not in provider_request_columns:
+                conn.execute("ALTER TABLE provider_requests ADD COLUMN response_timeout_s REAL")
+            provider_request_info = {
+                row["name"]: row
+                for row in conn.execute(
+                    "PRAGMA table_info(provider_requests)"
+                ).fetchall()
+            }
+            if int(provider_request_info["run_id"]["notnull"] or 0):
+                # SQLite cannot drop a NOT NULL constraint in place. Rebuild the
+                # exact table transactionally so upgraded databases can create a
+                # provider request before its native run has been assigned.
+                # Rebuild the child activity table in the same savepoint. With
+                # foreign keys enforced, dropping a populated parent first is
+                # illegal; moving the child rows to a table bound to the new
+                # parent preserves every relationship throughout the swap.
+                conn.execute("SAVEPOINT provider_requests_nullable_run_id")
+                try:
+                    conn.execute("DROP TABLE IF EXISTS provider_activity_migrated")
+                    conn.execute("DROP TABLE IF EXISTS provider_requests_migrated")
+                    conn.execute(
+                        """
+                        CREATE TABLE provider_requests_migrated (
+                            request_id TEXT PRIMARY KEY,
+                            tenant_id TEXT NOT NULL DEFAULT 'local',
+                            owner_id TEXT NOT NULL,
+                            session_id TEXT NOT NULL,
+                            run_id TEXT,
+                            idempotency_key TEXT NOT NULL,
+                            message_id TEXT NOT NULL DEFAULT '',
+                            stream_id TEXT NOT NULL DEFAULT '',
+                            state TEXT NOT NULL,
+                            requested_history_count INTEGER NOT NULL DEFAULT 0,
+                            replay_decision_json TEXT NOT NULL DEFAULT '{}',
+                            admitted_instruction TEXT NOT NULL DEFAULT '',
+                            response_json TEXT NOT NULL DEFAULT '',
+                            fallback_model_id TEXT NOT NULL DEFAULT '',
+                            fallback_reasoning_effort TEXT NOT NULL DEFAULT '',
+                            fallback_instruction TEXT NOT NULL DEFAULT '',
+                            fallback_state TEXT NOT NULL DEFAULT '',
+                            fallback_from_run_id TEXT NOT NULL DEFAULT '',
+                            response_timeout_s REAL,
+                            response_deadline_at TEXT NOT NULL DEFAULT '',
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            UNIQUE (tenant_id, owner_id, idempotency_key),
+                            FOREIGN KEY(session_id) REFERENCES provider_sessions(session_id),
+                            FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                        )
+                        """
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO provider_requests_migrated (
+                            request_id, tenant_id, owner_id, session_id, run_id,
+                            idempotency_key, message_id, stream_id, state,
+                            requested_history_count, replay_decision_json,
+                            admitted_instruction, response_json,
+                            fallback_model_id, fallback_reasoning_effort,
+                            fallback_instruction, fallback_state,
+                            fallback_from_run_id, response_timeout_s,
+                            response_deadline_at, created_at, updated_at
+                        )
+                        SELECT
+                            request_id, tenant_id, owner_id, session_id, run_id,
+                            idempotency_key, message_id, stream_id, state,
+                            requested_history_count, replay_decision_json,
+                            admitted_instruction, response_json,
+                            fallback_model_id, fallback_reasoning_effort,
+                            fallback_instruction, fallback_state,
+                            fallback_from_run_id, response_timeout_s,
+                            response_deadline_at, created_at, updated_at
+                        FROM provider_requests
+                        """
+                    )
+                    conn.execute(
+                        """
+                        CREATE TABLE provider_activity_migrated (
+                            sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            request_id TEXT NOT NULL,
+                            event_type TEXT NOT NULL,
+                            summary TEXT NOT NULL,
+                            payload_json TEXT NOT NULL DEFAULT '{}',
+                            created_at TEXT NOT NULL,
+                            FOREIGN KEY(request_id)
+                                REFERENCES provider_requests_migrated(request_id)
+                        )
+                        """
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO provider_activity_migrated (
+                            sequence_id, request_id, event_type, summary,
+                            payload_json, created_at
+                        )
+                        SELECT
+                            sequence_id, request_id, event_type, summary,
+                            payload_json, created_at
+                        FROM provider_activity
+                        """
+                    )
+                    conn.execute("DROP INDEX IF EXISTS idx_provider_activity_request")
+                    conn.execute("DROP TABLE provider_activity")
+                    conn.execute("DROP TABLE provider_requests")
+                    conn.execute(
+                        "ALTER TABLE provider_requests_migrated RENAME TO provider_requests"
+                    )
+                    conn.execute(
+                        "ALTER TABLE provider_activity_migrated "
+                        "RENAME TO provider_activity"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_provider_requests_session "
+                        "ON provider_requests(session_id, created_at)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_provider_activity_request "
+                        "ON provider_activity(request_id, sequence_id)"
+                    )
+                    conn.execute("RELEASE provider_requests_nullable_run_id")
+                except Exception:
+                    conn.execute("ROLLBACK TO provider_requests_nullable_run_id")
+                    conn.execute("RELEASE provider_requests_nullable_run_id")
+                    raise
+
+            provider_request_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(provider_requests)"
+                ).fetchall()
+            }
+            for column_name in ("native_invocation_id", "native_body_sha256"):
+                if column_name not in provider_request_columns:
+                    conn.execute(
+                        "ALTER TABLE provider_requests "
+                        f"ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''"
                     )
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_requests_native_invocation "
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_provider_requests_native_invocation "
                 "ON provider_requests(tenant_id, owner_id, native_invocation_id) "
                 "WHERE native_invocation_id <> ''"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_provider_requests_missing_response "
-                "ON provider_requests(created_at) WHERE state = 'completed' AND response_json = ''"
+                "ON provider_requests(created_at) "
+                "WHERE state = 'completed' AND response_json = ''"
             )
-            if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+
+            visible_admission_migration = "provider_visible_admissions_v1"
+            visible_admission_backfill_complete = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE name = ?",
+                (visible_admission_migration,),
+            ).fetchone()
+            for session_row in (
+                []
+                if visible_admission_backfill_complete
+                else conn.execute(
+                    "SELECT session_id, context_manifest_json, updated_at FROM provider_sessions"
+                ).fetchall()
+            ):
+                try:
+                    session_manifest = json.loads(
+                        str(session_row["context_manifest_json"] or "{}")
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    session_manifest = {}
+                if not isinstance(session_manifest, dict):
+                    continue
+                accepted_at = str(session_row["updated_at"] or utc_now())
+                advancement_key = str(
+                    session_manifest.get("last_accepted_advancement_key") or ""
+                )
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO provider_session_visible_admissions (
+                        session_id, message_key, advancement_key, accepted_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            str(session_row["session_id"]),
+                            str(message_key),
+                            advancement_key,
+                            accepted_at,
+                        )
+                        for message_key in list(
+                            session_manifest.get("accepted_visible_message_keys") or []
+                        )
+                        if str(message_key).strip()
+                    ],
+                )
+            if not visible_admission_backfill_complete:
+                for request_row in conn.execute(
+                    """
+                    SELECT session_id, replay_decision_json, updated_at
+                    FROM provider_requests
+                    WHERE state = 'completed'
+                    """
+                ).fetchall():
+                    try:
+                        decision = json.loads(
+                            str(request_row["replay_decision_json"] or "{}")
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        decision = {}
+                    if (
+                        not isinstance(decision, dict)
+                        or str(decision.get("main_context_protocol") or "")
+                        != "main_context_v1"
+                        or str(decision.get("admission_state") or "") != "accepted"
+                    ):
+                        continue
+                    message_keys = [
+                        str(value)
+                        for value in list(
+                            decision.get("admitted_visible_message_keys") or []
+                        )
+                        if str(value).strip()
+                    ]
+                    response_key = str(
+                        decision.get("response_message_key") or ""
+                    ).strip()
+                    if response_key:
+                        message_keys.append(response_key)
+                    conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO provider_session_visible_admissions (
+                            session_id, message_key, advancement_key, accepted_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                str(request_row["session_id"]),
+                                message_key,
+                                str(decision.get("advancement_key") or ""),
+                                str(request_row["updated_at"] or utc_now()),
+                            )
+                            for message_key in message_keys
+                        ],
+                    )
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, completed_at) VALUES (?, ?)",
+                    (visible_admission_migration, utc_now()),
+                )
+
+            ensure_parallel_orchestration_schema(conn)
+
+            violation = conn.execute("PRAGMA foreign_key_check").fetchone()
+            if violation is not None:
                 raise RuntimeError(
-                    "SQLite foreign-key integrity check failed (one or more violations)"
+                    "SQLite foreign-key integrity check failed "
+                    "(one or more violations)"
                 )
             record_schema_version(
                 conn,
                 component="runtime_store",
                 version=RUNTIME_STORE_SCHEMA_VERSION,
             )
-            if migrate_session_scope:
-                conn.commit()
-                conn.execute("PRAGMA foreign_keys = ON")
-                if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
-                    raise RuntimeError("SQLite foreign-key enforcement could not be restored")
+
+    @staticmethod
+    def _migrate_provider_session_identity(conn: sqlite3.Connection) -> None:
+        """Collapse legacy actor/origin splits onto the four-column identity."""
+
+        duplicate_groups = conn.execute(
+            """
+            SELECT tenant_id, owner_id, conversation_id, agent_id
+            FROM provider_sessions
+            GROUP BY tenant_id, owner_id, conversation_id, agent_id
+            HAVING COUNT(*) > 1
+            ORDER BY tenant_id, owner_id, conversation_id, agent_id
+            """
+        ).fetchall()
+        if duplicate_groups:
+            conn.execute("SAVEPOINT provider_session_identity_v1")
+            try:
+                for group in duplicate_groups:
+                    sessions = conn.execute(
+                        """
+                        SELECT session_id, updated_at, created_at
+                        FROM provider_sessions
+                        WHERE tenant_id = ? AND owner_id = ?
+                          AND conversation_id = ? AND agent_id = ?
+                        ORDER BY updated_at DESC, created_at DESC, session_id DESC
+                        """,
+                        (
+                            group["tenant_id"],
+                            group["owner_id"],
+                            group["conversation_id"],
+                            group["agent_id"],
+                        ),
+                    ).fetchall()
+                    survivor_id = str(sessions[0]["session_id"])
+                    for loser in sessions[1:]:
+                        loser_id = str(loser["session_id"])
+                        conn.execute(
+                            "UPDATE provider_requests SET session_id = ? WHERE session_id = ?",
+                            (survivor_id, loser_id),
+                        )
+                        admissions = conn.execute(
+                            """
+                            SELECT rowid, message_key, advancement_key, accepted_at
+                            FROM provider_session_visible_admissions
+                            WHERE session_id = ?
+                            ORDER BY accepted_at DESC, rowid DESC
+                            """,
+                            (loser_id,),
+                        ).fetchall()
+                        for admission in admissions:
+                            existing = conn.execute(
+                                """
+                                SELECT accepted_at
+                                FROM provider_session_visible_admissions
+                                WHERE session_id = ? AND message_key = ?
+                                """,
+                                (survivor_id, admission["message_key"]),
+                            ).fetchone()
+                            if existing is None:
+                                conn.execute(
+                                    """
+                                    INSERT INTO provider_session_visible_admissions (
+                                        session_id, message_key, advancement_key, accepted_at
+                                    ) VALUES (?, ?, ?, ?)
+                                    """,
+                                    (
+                                        survivor_id,
+                                        admission["message_key"],
+                                        admission["advancement_key"],
+                                        admission["accepted_at"],
+                                    ),
+                                )
+                            elif str(admission["accepted_at"] or "") > str(
+                                existing["accepted_at"] or ""
+                            ):
+                                conn.execute(
+                                    """
+                                    UPDATE provider_session_visible_admissions
+                                    SET advancement_key = ?, accepted_at = ?
+                                    WHERE session_id = ? AND message_key = ?
+                                    """,
+                                    (
+                                        admission["advancement_key"],
+                                        admission["accepted_at"],
+                                        survivor_id,
+                                        admission["message_key"],
+                                    ),
+                                )
+                        conn.execute(
+                            "DELETE FROM provider_session_visible_admissions WHERE session_id = ?",
+                            (loser_id,),
+                        )
+                        conn.execute(
+                            "DELETE FROM provider_sessions WHERE session_id = ?",
+                            (loser_id,),
+                        )
+                conn.execute("RELEASE provider_session_identity_v1")
+            except Exception:
+                conn.execute("ROLLBACK TO provider_session_identity_v1")
+                conn.execute("RELEASE provider_session_identity_v1")
+                raise
+
+        unique_index = None
+        for index in conn.execute("PRAGMA index_list(provider_sessions)").fetchall():
+            if not int(index["unique"]):
+                continue
+            index_name = str(index["name"])
+            escaped_name = index_name.replace('"', '""')
+            columns = [
+                str(row["name"])
+                for row in conn.execute(f'PRAGMA index_info("{escaped_name}")').fetchall()
+            ]
+            if columns == ["tenant_id", "owner_id", "conversation_id", "agent_id"]:
+                unique_index = index_name
+                break
+        if unique_index is None:
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_sessions_identity
+                ON provider_sessions(tenant_id, owner_id, conversation_id, agent_id)
+                """
+            )
+
+    def add_provider_activity_once(
+        self,
+        request_id: str,
+        event_type: str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Insert one request-scoped lifecycle event across concurrent processes."""
+
+        data = {
+            "request_id": request_id,
+            "event_type": event_type,
+            "summary": summary,
+            "payload_json": json.dumps(payload or {}, sort_keys=True),
+            "created_at": utc_now(),
+        }
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM provider_activity
+                WHERE request_id = ? AND event_type = ?
+                ORDER BY sequence_id ASC LIMIT 1
+                """,
+                (request_id, event_type),
+            ).fetchone()
+            if row is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO provider_activity (
+                        request_id, event_type, summary, payload_json, created_at
+                    ) VALUES (
+                        :request_id, :event_type, :summary, :payload_json, :created_at
+                    )
+                    """,
+                    data,
+                )
+                row = conn.execute(
+                    "SELECT * FROM provider_activity WHERE sequence_id = ?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+            conn.execute("COMMIT")
+        return dict(row)
+
+    def get_confirmed_host_pause_marker_for_run(
+        self,
+        run_id: str,
+        *,
+        worker_id: str = "",
+        expected_started_at: str = "",
+    ) -> dict[str, Any] | None:
+        """Return the exact durable host-pause proof for one run generation."""
+
+        parameters: list[str] = [str(run_id)]
+        worker_clause = ""
+        started_clause = ""
+        if worker_id:
+            worker_clause = " AND leases.worker_id = ?"
+            parameters.append(str(worker_id))
+        if expected_started_at:
+            started_clause = " AND COALESCE(runs.started_at, '') = ?"
+            parameters.append(str(expected_started_at))
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT leases.*
+                FROM host_run_leases AS leases
+                JOIN runs ON runs.run_id = leases.run_id
+                WHERE leases.run_id = ?
+                  AND leases.status = 'released'
+                  AND leases.release_reason = 'pause_run_confirmed'
+                  AND leases.startup_state = 'confirmed'
+                  AND COALESCE(leases.startup_confirmed_at, '') <> ''
+                  AND COALESCE(leases.released_at, '') <> ''
+                  AND COALESCE(leases.reconciled_at, '') <> ''
+                  AND COALESCE(leases.attempt_id, '') = COALESCE(runs.active_attempt_id, '')
+                """
+                + worker_clause
+                + started_clause
+                + " ORDER BY leases.released_at DESC, leases.lease_id DESC LIMIT 1",
+                parameters,
+            ).fetchone()
+        return self._row(row)
+
+    def list_provider_request_run_generations(
+        self,
+        *,
+        request_id: str,
+        tenant_id: str,
+        owner_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return the current and retained prior run for one owner-scoped provider request."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                WITH request_scope AS (
+                    SELECT run_id, fallback_from_run_id
+                    FROM provider_requests
+                    WHERE request_id = ? AND tenant_id = ? AND owner_id = ?
+                ), generation_links AS (
+                    SELECT run_id, 1 AS generation_order, 'current' AS generation_kind
+                    FROM request_scope
+                    WHERE run_id IS NOT NULL AND run_id != ''
+                    UNION ALL
+                    SELECT
+                        CASE
+                            WHEN fallback_from_run_id LIKE 'context_recovery:%'
+                            THEN substr(fallback_from_run_id, length('context_recovery:') + 1)
+                            ELSE fallback_from_run_id
+                        END AS run_id,
+                        0 AS generation_order,
+                        'retained_prior' AS generation_kind
+                    FROM request_scope
+                    WHERE fallback_from_run_id != ''
+                )
+                SELECT runs.*, generation_links.generation_kind
+                FROM generation_links
+                JOIN runs ON runs.run_id = generation_links.run_id
+                JOIN workers ON workers.worker_id = runs.worker_id
+                WHERE workers.tenant_id = ? AND workers.owner_id = ?
+                ORDER BY generation_links.generation_order, runs.run_id
+                """,
+                (request_id, tenant_id or "local", owner_id, tenant_id or "local", owner_id),
+            ).fetchall()
+        generations: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            generation = self._row(row)
+            run_id = str((generation or {}).get("run_id") or "")
+            if generation is None or not run_id or run_id in seen:
+                continue
+            seen.add(run_id)
+            generations.append(generation)
+        return generations
+
+    def list_provider_requests_pending_terminal_reconciliation(
+        self,
+        *,
+        limit: int = 64,
+    ) -> list[dict[str, Any]]:
+        """Find run-terminal requests whose provider settlement is still incomplete."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT request.*
+                FROM provider_requests AS request
+                JOIN runs AS run ON run.run_id = request.run_id
+                WHERE run.state IN (
+                    'completed', 'failed', 'cancelled', 'interrupted', 'needs_input'
+                )
+                  AND (
+                    request.state IN ('queued', 'running')
+                    OR (
+                      NOT EXISTS (
+                        SELECT 1 FROM provider_activity AS activity
+                        WHERE activity.request_id = request.request_id
+                          AND activity.event_type = request.state
+                      )
+                      AND (
+                        (request.state = 'completed' AND run.state = 'completed')
+                        OR (
+                          request.state = 'failed'
+                          AND (
+                            run.state IN ('failed', 'needs_input')
+                            OR (
+                              run.state = 'interrupted'
+                              AND run.failure_retryable = 1
+                              AND run.failure_structured = 1
+                            )
+                          )
+                        )
+                        OR (
+                          request.state = 'cancelled'
+                          AND (
+                            run.state = 'cancelled'
+                            OR (
+                              run.state = 'interrupted'
+                              AND NOT (
+                                run.failure_retryable = 1
+                                AND run.failure_structured = 1
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                ORDER BY run.ended_at ASC, request.updated_at ASC, request.request_id ASC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 256)),),
+            ).fetchall()
+        return self._rows(rows)
 
     @staticmethod
     def _migrate_provider_session_scopes(conn: sqlite3.Connection) -> None:
@@ -3779,6 +6185,119 @@ class Store:
             rows = conn.execute("SELECT * FROM workers ORDER BY created_at DESC").fetchall()
         return self._rows(rows)
 
+    def count_active_host_missions(self) -> int:
+        """Count durable host mission roots that could conflict with Parallel Main.
+
+        Nonterminal rows remain blockers even when paused or waiting for input:
+        policy prevents them from restarting while isolated Parallel mode is
+        enabled, but readiness must not describe that retained work as gone.
+        An active lease is included independently so a crash between state
+        transitions cannot make the capability probe optimistic.
+        """
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(DISTINCT worker_id)
+                FROM (
+                    SELECT workers.worker_id AS worker_id
+                    FROM workers
+                    JOIN runs ON runs.worker_id = workers.worker_id
+                    WHERE workers.execution_mode = 'host'
+                      AND workers.trusted_run_lane = 'mission'
+                      AND runs.state NOT IN (
+                          'completed', 'failed', 'cancelled', 'interrupted'
+                      )
+                    UNION
+                    SELECT leases.worker_id AS worker_id
+                    FROM host_run_leases AS leases
+                    JOIN workers ON workers.worker_id = leases.worker_id
+                    WHERE leases.status = 'active'
+                      AND workers.execution_mode = 'host'
+                      AND workers.trusted_run_lane = 'mission'
+                ) AS active_host_missions
+                """
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def active_host_mission_worker_ids(self) -> set[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT worker_id
+                FROM (
+                    SELECT workers.worker_id AS worker_id
+                    FROM workers
+                    JOIN runs ON runs.worker_id = workers.worker_id
+                    WHERE workers.execution_mode = 'host'
+                      AND workers.trusted_run_lane = 'mission'
+                      AND runs.state NOT IN (
+                          'completed', 'failed', 'cancelled', 'interrupted'
+                      )
+                    UNION
+                    SELECT leases.worker_id AS worker_id
+                    FROM host_run_leases AS leases
+                    JOIN workers ON workers.worker_id = leases.worker_id
+                    WHERE leases.status = 'active'
+                      AND workers.execution_mode = 'host'
+                      AND workers.trusted_run_lane = 'mission'
+                )
+                """
+            ).fetchall()
+        return {str(row["worker_id"]) for row in rows}
+
+    def list_host_mission_workers(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM workers
+                WHERE execution_mode = 'host'
+                  AND trusted_run_lane = 'mission'
+                ORDER BY created_at ASC, worker_id ASC
+                """
+            ).fetchall()
+        return self._rows(rows)
+
+    def conclusively_terminal_host_mission_history(
+        self,
+    ) -> set[tuple[str, str]]:
+        """Return uncertain-process records that can only be finished history.
+
+        A runtime observation of ``active`` remains authoritative. This query is
+        only used for ``uncertain`` observations. It returns exact terminal runs
+        whose worker has no nonterminal mission or active lease.
+        """
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT workers.worker_id, runs.run_id
+                FROM workers
+                JOIN runs ON runs.worker_id = workers.worker_id
+                WHERE workers.execution_mode = 'host'
+                  AND workers.trusted_run_lane = 'mission'
+                  AND runs.state IN (
+                      'completed', 'failed', 'cancelled', 'interrupted'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS current_runs
+                      WHERE current_runs.worker_id = workers.worker_id
+                        AND current_runs.state NOT IN (
+                            'completed', 'failed', 'cancelled', 'interrupted'
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM host_run_leases AS active_leases
+                      WHERE active_leases.worker_id = workers.worker_id
+                        AND active_leases.status = 'active'
+                  )
+                """
+            ).fetchall()
+        return {
+            (str(row["worker_id"]), str(row["run_id"]))
+            for row in rows
+        }
+
     def list_workers(
         self,
         project_id: str,
@@ -3908,11 +6427,14 @@ class Store:
     def update_worker(
         self,
         worker_id: str,
+        *,
+        touch_updated_at: bool = True,
         **fields: Any,
     ) -> dict[str, Any] | None:
         if not fields:
             return self.get_worker(worker_id)
-        fields["updated_at"] = utc_now()
+        if touch_updated_at:
+            fields["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = :{key}" for key in fields.keys())
         fields["worker_id"] = worker_id
         target_state = str(fields.get("state") or "")
@@ -4164,7 +6686,7 @@ class Store:
         worker_id: str,
         **fields: Any,
     ) -> dict[str, Any] | None:
-        """Publish terminal runtime data only while this close attempt still owns the CAS."""
+        """Publish terminal runtime data and its durable side effects atomically."""
 
         now = utc_now()
         values = {
@@ -4179,17 +6701,53 @@ class Store:
         )
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            changed = conn.execute(
                 f"UPDATE workers SET {assignments} "
                 "WHERE worker_id = :worker_id AND state = 'terminating'",
                 values,
             )
+            effect_ids: list[str] = []
+            event_id = ""
+            if worker is not None and changed.rowcount == 1:
+                operation_token = (
+                    f"terminate:{worker_id}:{str(worker['updated_at'] or '')}"
+                )
+                effect_ids = self._enqueue_lifecycle_effects(
+                    conn,
+                    operation_token=operation_token,
+                    operation_epoch=0,
+                    operation_kind="terminate_worker",
+                    worker_id=worker_id,
+                    effect_kinds=(
+                        "callback.worker_terminated",
+                        "signed_links.revoke_worker",
+                    ),
+                )
+                event_id = self._insert_lifecycle_event(
+                    conn,
+                    operation_token=operation_token,
+                    operation_epoch=0,
+                    operation_kind="terminate_worker",
+                    worker=worker,
+                    run_id="",
+                    event_type="worker.terminated",
+                    message="Worker terminated",
+                    payload={"operation_kind": "terminate_worker"},
+                )
             row = conn.execute(
                 "SELECT * FROM workers WHERE worker_id = ?",
                 (worker_id,),
             ).fetchone()
             conn.execute("COMMIT")
-        return self._row(row)
+        result = self._row(row)
+        if result is not None and changed.rowcount == 1:
+            result["effect_ids"] = effect_ids
+            result["event_id"] = event_id
+        return result
 
     def count_workers(
         self,
@@ -4383,12 +6941,29 @@ class Store:
             "error_text": "",
             "failure_class": "",
             "failure_retryable": 0,
+            "failure_structured": 0,
             "failure_user_message": "",
             "failure_recommended_recovery": "",
             "failure_diagnostic_summary": "",
             "retry_after": None,
             "retry_attempts": 0,
             "last_retry_class": "",
+            "native_session_id": "",
+            "native_capabilities_json": "{}",
+            "native_child_summary_json": "{}",
+            "_origin_trace": origin_trace,
+            "continuation_contract_json": json.dumps(
+                continuation_contract if isinstance(continuation_contract, dict) else {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "continuation_context_json": json.dumps(
+                continuation_context if isinstance(continuation_context, dict) else {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         }
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -5265,6 +7840,25 @@ class Store:
             row = conn.execute(query, params).fetchone()
         return self._row(row)
 
+    @staticmethod
+    def _run_is_owned_by_destructive_claim(
+        worker: sqlite3.Row, run_id: str
+    ) -> bool:
+        return bool(
+            str(worker["compute_release_token"] or "")
+            and str(worker["compute_release_target_run_id"] or "") == str(run_id)
+            and str(worker["compute_release_kind"] or "")
+            in {
+                "pause_run",
+                "resume_run",
+                "interrupt_run",
+                "steer_run",
+                "max_duration",
+                "stop_run",
+                "terminate_worker",
+            }
+        )
+
     def update_run(self, run_id: str, **fields: Any) -> dict[str, Any] | None:
         if not fields:
             return self.get_run(run_id)
@@ -5774,10 +8368,234 @@ class Store:
     def get_active_run(self, worker_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM runs WHERE worker_id = ? AND state = 'running' ORDER BY started_at DESC LIMIT 1",
+                """
+                SELECT * FROM runs
+                WHERE worker_id = ?
+                  AND state IN ('claimed', 'admitted', 'running', 'settling')
+                ORDER BY COALESCE(started_at, admitted_at, claimed_at, queued_at) DESC
+                LIMIT 1
+                """,
                 (worker_id,),
             ).fetchone()
         return self._row(row)
+
+    def get_controllable_run(self, worker_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE worker_id = ? AND state IN (
+                    'queued', 'claimed', 'admitted', 'running', 'settling', 'paused'
+                )
+                ORDER BY COALESCE(started_at, queued_at) DESC
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+        return self._row(row)
+
+    def list_nonterminal_runs_for_worker(self, worker_id: str) -> list[dict[str, Any]]:
+        """Return every durable mission run that still requires control or execution."""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE worker_id = ?
+                  AND state IN (
+                      'queued', 'claimed', 'admitted', 'running', 'settling', 'paused', 'needs_input'
+                  )
+                ORDER BY
+                    CASE state
+                        WHEN 'running' THEN 0
+                        WHEN 'admitted' THEN 1
+                        WHEN 'claimed' THEN 2
+                        WHEN 'settling' THEN 3
+                        WHEN 'paused' THEN 4
+                        WHEN 'needs_input' THEN 5
+                        ELSE 6
+                    END,
+                    COALESCE(started_at, queued_at) ASC,
+                    run_id ASC
+                """,
+                (worker_id,),
+            ).fetchall()
+        return self._rows(rows)
+
+    def cancel_queued_runs_for_worker(
+        self,
+        worker_id: str,
+        *,
+        error_text: str,
+        exclude_run_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Cancel pending siblings as one mission-scoped Stop subeffect."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE worker_id = ? AND state IN ('queued', 'needs_input')
+                  AND (? = '' OR run_id != ?)
+                ORDER BY queued_at ASC, run_id ASC
+                """,
+                (worker_id, exclude_run_id, exclude_run_id),
+            ).fetchall()
+            run_ids = [str(row["run_id"]) for row in rows]
+            if run_ids:
+                placeholders = ",".join("?" for _ in run_ids)
+                conn.execute(
+                    f"""
+                    UPDATE runs
+                    SET state = 'cancelled', ended_at = ?, error_text = ?,
+                        failure_class = '', failure_retryable = 0,
+                        failure_structured = 0, failure_user_message = '',
+                        failure_recommended_recovery = '',
+                        failure_diagnostic_summary = '', retry_after = NULL,
+                        retry_attempts = 0, last_retry_class = ''
+                    WHERE run_id IN ({placeholders})
+                      AND state IN ('queued', 'needs_input')
+                    """,
+                    (now, error_text, *run_ids),
+                )
+                for cancelled_run_id in run_ids:
+                    self._record_terminal_artifact_trace_conn(
+                        conn,
+                        run_id=cancelled_run_id,
+                        observed_at=now,
+                    )
+            conn.execute("COMMIT")
+        return [
+            self.get_run(run_id)
+            for run_id in run_ids
+            if self.get_run(run_id) is not None
+        ]
+
+    def transition_run_if_state(
+        self,
+        run_id: str,
+        expected_state: str,
+        state: str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        if state == "cancelled":
+            for key, value in CANCELLATION_CLEAR_FIELDS.items():
+                fields.setdefault(key, value)
+        if state in TERMINAL_RUN_STATES:
+            fields.setdefault("ended_at", utc_now())
+        values = {"run_id": run_id, "expected_state": expected_state, "state": state, **fields}
+        assignments = ["state = :state"]
+        assignments.extend(f"{key} = :{key}" for key in fields)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                conn.execute("COMMIT")
+                return None
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?", (run["worker_id"],)
+            ).fetchone()
+            if (
+                "started_at" in fields
+                and str(run["started_at"] or "")
+                and str(fields.get("started_at") or "")
+                != str(run["started_at"] or "")
+            ):
+                conn.execute("COMMIT")
+                return None
+            if state in NONTERMINAL_RUN_STATES:
+                self._require_worker_work_admission(worker)
+            if state in {"claimed", "admitted"}:
+                conn.execute("COMMIT")
+                return None
+            if state == "running" and not self._running_generation_is_exact_conn(
+                conn, run_id, now=utc_now()
+            ):
+                conn.execute("COMMIT")
+                return None
+            if (
+                worker is not None
+                and self._run_is_owned_by_destructive_claim(worker, run_id)
+                and state not in TERMINAL_RUN_STATES
+            ):
+                conn.execute("COMMIT")
+                return None
+            cursor = conn.execute(
+                f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = :run_id AND state = :expected_state",
+                values,
+            )
+            if (
+                cursor.rowcount
+                and state == "running"
+                and not self._running_generation_is_exact_conn(
+                    conn, run_id, now=utc_now()
+                )
+            ):
+                conn.execute("ROLLBACK")
+                return None
+            if (
+                cursor.rowcount
+                and (state in TERMINAL_RUN_STATES or state == "needs_input")
+                and str(run["active_attempt_id"] or "")
+            ):
+                attempt_ended_at = str(fields.get("ended_at") or utc_now())
+                conn.execute(
+                    """
+                    UPDATE run_attempts
+                    SET state = ?, ended_at = ?, terminal_reason = ?
+                    WHERE attempt_id = ? AND ended_at IS NULL
+                    """,
+                    (
+                        state,
+                        attempt_ended_at,
+                        state,
+                        str(run["active_attempt_id"] or ""),
+                    ),
+                )
+                self._append_attempt_trace_conn(
+                    conn,
+                    attempt_id=str(run["active_attempt_id"] or ""),
+                    created_at=attempt_ended_at,
+                )
+            if cursor.rowcount and state in TERMINAL_RUN_STATES:
+                self._record_terminal_artifact_trace_conn(
+                    conn,
+                    run_id=str(run_id),
+                    observed_at=str(fields.get("ended_at") or utc_now()),
+                )
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            conn.execute("COMMIT")
+        updated = self._row(row)
+        return updated if cursor.rowcount and updated else None
+
+    def mark_run_needs_input(
+        self,
+        run_id: str,
+        *,
+        expected_state: str = "running",
+        error_text: str,
+        failure_class: str,
+        failure_user_message: str,
+    ) -> dict[str, Any] | None:
+        return self.transition_run_if_state(
+            run_id,
+            expected_state,
+            "needs_input",
+            ended_at=None,
+            error_text=error_text,
+            retry_after=None,
+            failure_class=failure_class,
+            failure_retryable=0,
+            failure_structured=1,
+            failure_user_message=failure_user_message,
+            failure_recommended_recovery="Provide the requested authorization, then resume this work.",
+            failure_diagnostic_summary="Deferred broker admission requires user input.",
+        )
 
     def list_runs_by_state(self, state: str, limit: int = 1000) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -5787,6 +8605,188 @@ class Store:
             ).fetchall()
         return self._rows(rows)
 
+    def list_terminal_runs_missing_callback_intent(
+        self,
+        *,
+        created_before: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return terminal generations with no durable callback sink."""
+
+        result_digest_sql = "glasshive_terminal_result_digest(" + ", ".join(
+            f"runs.{field}" for field in TERMINAL_RESULT_DIGEST_FIELDS
+        ) + ")"
+        query = f"""
+            SELECT runs.*
+            FROM runs
+            JOIN workers ON workers.worker_id = runs.worker_id
+            WHERE runs.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+              AND runs.ended_at IS NOT NULL
+              AND runs.ended_at != ''
+              AND workers.bootstrap_bundle_json IS NOT NULL
+              AND json_valid(workers.bootstrap_bundle_json)
+              AND COALESCE(
+                    json_extract(
+                        workers.bootstrap_bundle_json,
+                        '$.callbacks.events_webhook_url'
+                    ),
+                    json_extract(
+                        workers.bootstrap_bundle_json,
+                        '$.callbacks.url'
+                    ),
+                    ''
+                  ) != ''
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM callback_outbox
+                  WHERE callback_outbox.run_id = runs.run_id
+                    AND callback_outbox.event_type = 'run.' || runs.state
+                    AND callback_outbox.attempt_number = COALESCE(
+                        (
+                            SELECT MAX(run_attempts.attempt_number)
+                            FROM run_attempts
+                            WHERE run_attempts.run_id = runs.run_id
+                        ),
+                        0
+                    )
+                    AND (
+                        (
+                            callback_outbox.result_revision =
+                                runs.terminal_result_revision
+                            AND callback_outbox.result_digest = {result_digest_sql}
+                        )
+                        OR (
+                            substr(callback_outbox.callback_id, 1, 16) =
+                                'cb_run_terminal_'
+                            AND callback_outbox.result_revision = 0
+                            AND callback_outbox.result_digest = ''
+                        )
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM terminal_callback_reconciliations
+                  WHERE terminal_callback_reconciliations.run_id = runs.run_id
+                    AND terminal_callback_reconciliations.state = runs.state
+                    AND terminal_callback_reconciliations.ended_at = runs.ended_at
+                    AND terminal_callback_reconciliations.attempt_number = COALESCE(
+                        (
+                            SELECT MAX(run_attempts.attempt_number)
+                            FROM run_attempts
+                            WHERE run_attempts.run_id = runs.run_id
+                        ),
+                        0
+                    )
+                    AND terminal_callback_reconciliations.callback_contract_digest =
+                        glasshive_sha256(
+                            COALESCE(workers.bootstrap_bundle_json, '')
+                        )
+                    AND terminal_callback_reconciliations.status = 'unavailable'
+              )
+        """
+        params: list[Any] = []
+        if created_before:
+            query += " AND runs.ended_at <= ?"
+            params.append(str(created_before))
+        query += " ORDER BY runs.ended_at ASC, runs.run_id ASC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return self._rows(rows)
+
+    def mark_terminal_callback_reconciliation_unavailable(
+        self,
+        run_id: str,
+        *,
+        expected_state: str,
+        expected_ended_at: str,
+        expected_attempt_number: int,
+        expected_callback_contract_digest: str,
+        reason_code: str,
+    ) -> dict[str, Any] | None:
+        """Classify one exact terminal callback contract as undeliverable."""
+
+        clean_reason = str(reason_code or "").strip()
+        if clean_reason not in {
+            "callback_config_missing",
+            "callback_context_incomplete",
+        }:
+            raise ValueError("Invalid terminal callback reconciliation reason")
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """
+                SELECT runs.*, workers.bootstrap_bundle_json
+                FROM runs
+                JOIN workers ON workers.worker_id = runs.worker_id
+                WHERE runs.run_id = ?
+                """,
+                (str(run_id),),
+            ).fetchone()
+            current_attempt_number = (
+                self._callback_attempt_number_conn(conn, str(run_id))
+                if current is not None
+                else 0
+            )
+            current_contract_digest = (
+                _text_sha256(current["bootstrap_bundle_json"] or "")
+                if current is not None
+                else ""
+            )
+            if (
+                current is None
+                or str(current["state"] or "") != str(expected_state or "")
+                or str(current["state"] or "") not in TERMINAL_RUN_STATES
+                or str(current["ended_at"] or "")
+                != str(expected_ended_at or "")
+                or current_attempt_number != max(0, int(expected_attempt_number))
+                or current_contract_digest
+                != str(expected_callback_contract_digest or "")
+            ):
+                conn.execute("COMMIT")
+                return None
+            conn.execute(
+                """
+                INSERT INTO terminal_callback_reconciliations (
+                    run_id, state, ended_at, attempt_number,
+                    callback_contract_digest, status, reason_code, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'unavailable', ?, ?)
+                ON CONFLICT (
+                    run_id, state, ended_at, attempt_number,
+                    callback_contract_digest
+                ) DO UPDATE SET
+                    status = 'unavailable',
+                    reason_code = excluded.reason_code,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(run_id),
+                    str(expected_state),
+                    str(expected_ended_at),
+                    current_attempt_number,
+                    current_contract_digest,
+                    clean_reason,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM terminal_callback_reconciliations
+                WHERE run_id = ? AND state = ? AND ended_at = ?
+                  AND attempt_number = ? AND callback_contract_digest = ?
+                """,
+                (
+                    str(run_id),
+                    str(expected_state),
+                    str(expected_ended_at),
+                    current_attempt_number,
+                    current_contract_digest,
+                ),
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row)
+
     def has_queued_runs(self, worker_id: str) -> bool:
         with self._connect() as conn:
             row = conn.execute(
@@ -5794,6 +8794,238 @@ class Store:
                 (worker_id,),
             ).fetchone()
         return row is not None
+
+    def has_queued_capacity_retry(self, worker_id: str) -> bool:
+        """Return whether restart recovery may reactivate a persisted capacity wait."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND retry_after IS NOT NULL
+                  AND retry_after != ''
+                  AND failure_retryable = 1
+                  AND failure_structured = 1
+                  AND failure_class IN ('host_capacity', 'host_worker_busy')
+                  AND last_retry_class IN ('host_capacity', 'host_worker_busy')
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+        return row is not None
+
+    def has_queued_running_invariant_retry(self, worker_id: str) -> bool:
+        """Return whether startup recovery requeued an unowned running generation."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND retry_after IS NOT NULL
+                  AND retry_after != ''
+                  AND failure_retryable = 1
+                  AND failure_structured = 1
+                  AND failure_class = 'running_invariant_reconciled'
+                  AND last_retry_class = 'running_invariant_reconciled'
+                  AND queue_blocker_class = 'running_invariant_reconciled'
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+        return row is not None
+
+    def reconcile_automatic_retry_worker(self, worker_id: str) -> dict[str, Any] | None:
+        """Atomically project a system retry without overriding durable pause intent."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            retry = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE worker_id = ?
+                  AND state = 'queued'
+                  AND retry_after IS NOT NULL
+                  AND retry_after != ''
+                  AND failure_retryable = 1
+                  AND failure_structured = 1
+                  AND (
+                      (
+                          failure_class IN ('host_capacity', 'host_worker_busy')
+                          AND last_retry_class IN ('host_capacity', 'host_worker_busy')
+                      )
+                      OR (
+                          failure_class = 'running_invariant_reconciled'
+                          AND last_retry_class = 'running_invariant_reconciled'
+                          AND queue_blocker_class = 'running_invariant_reconciled'
+                      )
+                  )
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            if worker is None or retry is None:
+                conn.execute("COMMIT")
+                return None
+            paused_run = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE worker_id = ? AND state = 'paused'
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            latest_control = conn.execute(
+                """
+                SELECT event_type FROM events
+                WHERE worker_id = ?
+                  AND event_type IN (
+                      'worker.paused', 'worker.resumed', 'worker.resumed_by_alias'
+                  )
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+            operator_paused = bool(
+                latest_control is not None
+                and str(latest_control["event_type"] or "") == "worker.paused"
+            )
+            state = "paused" if paused_run is not None or operator_paused else "ready"
+            conn.execute(
+                """
+                UPDATE workers
+                SET state = ?
+                WHERE worker_id = ?
+                  AND compute_release_token = ''
+                  AND COALESCE(work_stop_id, '') = ''
+                  AND state NOT IN ('needs_input', 'stopping', 'terminated',
+                                    'terminating', 'termination_failed')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS active
+                      WHERE active.worker_id = workers.worker_id
+                        AND active.state IN ('claimed', 'admitted', 'running', 'settling')
+                  )
+                """,
+                (state, worker_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row)
+
+    def reconcile_restart_authority_blocked_workers(
+        self,
+        *,
+        limit: int = 64,
+    ) -> list[str]:
+        """Unblock siblings behind an exact-replay-recoverable stateless turn."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT workers.worker_id
+                FROM workers
+                WHERE workers.state IN ('needs_input', 'paused')
+                  AND workers.work_stop_id = ''
+                  AND workers.compute_release_token = ''
+                  AND EXISTS (
+                      SELECT 1 FROM runs AS blocked
+                      WHERE blocked.worker_id = workers.worker_id
+                        AND blocked.state = 'needs_input'
+                        AND blocked.failure_class =
+                            'conversation_capability_grant_required'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM host_run_leases
+                            WHERE host_run_leases.run_id = blocked.run_id
+                              AND host_run_leases.status = 'active'
+                        )
+                        AND EXISTS (
+                            SELECT 1 FROM provider_requests
+                            WHERE provider_requests.run_id = blocked.run_id
+                              AND provider_requests.state = 'failed'
+                              AND COALESCE(
+                                  json_extract(
+                                      provider_requests.replay_decision_json,
+                                      '$.provider_session_mode'
+                                  ),
+                                  ''
+                              ) = 'stateless'
+                        )
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM runs AS sibling
+                      WHERE sibling.worker_id = workers.worker_id
+                        AND sibling.state = 'queued'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs AS paused
+                      WHERE paused.worker_id = workers.worker_id
+                        AND paused.state = 'paused'
+                  )
+                  AND COALESCE(
+                      (
+                          SELECT event_type FROM events
+                          WHERE events.worker_id = workers.worker_id
+                            AND event_type IN (
+                                'worker.paused', 'worker.resumed',
+                                'worker.resumed_by_alias'
+                            )
+                          ORDER BY rowid DESC
+                          LIMIT 1
+                      ),
+                      ''
+                  ) != 'worker.paused'
+                ORDER BY workers.worker_id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 256)),),
+            ).fetchall()
+            worker_ids = [str(row["worker_id"]) for row in rows]
+            for worker_id in worker_ids:
+                conn.execute(
+                    """
+                    UPDATE workers
+                    SET state = 'ready'
+                    WHERE worker_id = ?
+                      AND state IN ('needs_input', 'paused')
+                      AND work_stop_id = ''
+                      AND compute_release_token = ''
+                    """,
+                    (worker_id,),
+                )
+            conn.execute("COMMIT")
+        return worker_ids
+
+    def has_active_operator_pause(self, worker_id: str) -> bool:
+        """Return whether the latest explicit pause/resume intent is still paused."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT event_type FROM events
+                WHERE worker_id = ?
+                  AND event_type IN (
+                      'worker.paused', 'worker.resumed', 'worker.resumed_by_alias'
+                  )
+                -- Events are append-only in this local SQLite store. rowid is
+                -- the durable transition order and avoids timestamp ties.
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+        return row is not None and str(row["event_type"] or "") == "worker.paused"
 
     def next_retry_after_for_worker(self, worker_id: str) -> str | None:
         with self._connect() as conn:
@@ -6269,31 +9501,727 @@ class Store:
         **failure_fields: Any,
     ) -> dict[str, Any] | None:
         normalized_failure_fields = _normalized_failure_fields(failure_fields)
+        observed_at = utc_now()
+        refresh_interval_s = max(
+            10,
+            min(
+                int(
+                    queue_status_refresh_interval_s
+                    if queue_status_refresh_interval_s is not None
+                    else _queue_status_refresh_interval_seconds()
+                ),
+                24 * 60 * 60,
+            ),
+        )
         update_fields = {
             "run_id": run_id,
             "retry_after": retry_after,
             "error_text": error_text,
             "last_retry_class": str(last_retry_class or normalized_failure_fields.get("failure_class") or ""),
+            "retry_attempt_increment": 1 if consume_retry_budget else 0,
+            "capacity_retry_increment": (
+                1
+                if str(
+                    normalized_failure_fields.get("failure_class")
+                    or last_retry_class
+                )
+                in {"host_capacity", "host_worker_busy"}
+                else 0
+            ),
+            "capacity_class": str(capacity_class or ""),
+            "capacity_available_json": _capacity_json(capacity_available),
+            "capacity_required_json": _capacity_json(capacity_required),
+            "capacity_shortage_json": _capacity_json(capacity_shortage),
+            "capacity_reservation_json": _capacity_json(capacity_reservation),
+            "capacity_next_retry_at": str(capacity_next_retry_at or "") or None,
+            "attempt_ended_at": observed_at,
+            "queue_observed_at": observed_at,
             **normalized_failure_fields,
         }
         failure_assignments = "".join(f", {key} = :{key}" for key in normalized_failure_fields.keys())
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                conn.execute("COMMIT")
+                return None
+            attempt_id = str(run["active_attempt_id"] or "")
+            lease = conn.execute(
+                "SELECT * FROM host_run_leases WHERE run_id = ? AND attempt_id = ?",
+                (str(run_id), attempt_id),
+            ).fetchone()
+            expected_generation = {
+                "attempt_id": str(expected_attempt_id or ""),
+                "lease_id": str(expected_lease_id or ""),
+                "executor_id": str(expected_executor_id or ""),
+                "startup_token": str(expected_startup_token or ""),
+            }
+            if attempt_id:
+                exact_generation = bool(
+                    expected_generation["attempt_id"] == attempt_id
+                    and (
+                        (
+                            lease is not None
+                            and str(lease["attempt_id"] or "") == attempt_id
+                            and str(lease["lease_id"] or "")
+                            == expected_generation["lease_id"]
+                            and str(lease["executor_id"] or "")
+                            == expected_generation["executor_id"]
+                            and str(lease["startup_token"] or "")
+                            == expected_generation["startup_token"]
+                        )
+                        or (
+                            lease is None
+                            and not expected_generation["lease_id"]
+                            and not expected_generation["executor_id"]
+                            and not expected_generation["startup_token"]
+                        )
+                    )
+                )
+                if not exact_generation:
+                    conn.execute("COMMIT")
+                    return None
+            elif any(expected_generation.values()):
+                conn.execute("COMMIT")
+                return None
+            self._require_worker_work_admission(
+                conn.execute(
+                    "SELECT * FROM workers WHERE worker_id = ?", (run["worker_id"],)
+                ).fetchone()
+            )
+            blocker_class = str(
+                normalized_failure_fields.get("failure_class")
+                or last_retry_class
+                or capacity_class
+                or "admission_pending"
+            )
+            wait_open = bool(run["queue_wait_open"])
+            generation = max(1, int(run["queue_wait_generation"] or 0))
+            if not wait_open:
+                generation += 1
+                wait_started_at = observed_at
+                deadline = (
+                    _parse_utc(observed_at)
+                    + timedelta(seconds=_queue_wait_timeout_seconds())
+                ).isoformat()
+                next_status_at = (
+                    _parse_utc(observed_at)
+                    + timedelta(seconds=refresh_interval_s)
+                ).isoformat()
+                transition_emitted = 0
+                status_sequence = 0
+                callback_state = "unknown"
+            else:
+                wait_started_at = str(
+                    run["queue_wait_started_at"] or run["first_queued_at"]
+                )
+                deadline = str(run["queue_deadline_at"] or "")
+                next_status_at = run["queue_next_status_at"]
+                transition_emitted = int(run["queue_transition_emitted"] or 0)
+                status_sequence = int(run["queue_status_sequence"] or 0)
+                callback_state = str(run["queue_callback_state"] or "unknown")
+            update_fields.update(
+                {
+                    "expected_attempt_id": attempt_id,
+                    "queue_blocker_class": blocker_class,
+                    "queue_wait_episode": generation,
+                    "queue_wait_open": 1,
+                    "queue_wait_generation": generation,
+                    "queue_wait_started_at": wait_started_at,
+                    "queue_wait_closed_at": None,
+                    "queue_wait_duration_seconds": None,
+                    "queue_deadline_at": deadline,
+                    "queue_next_status_at": next_status_at,
+                    "queue_transition_emitted": transition_emitted,
+                    "queue_status_sequence": status_sequence,
+                    "queue_callback_state": callback_state,
+                    "queue_terminal_callback_id": _queue_callback_id(
+                        "timeout",
+                        run_id=str(run_id),
+                        generation=generation,
+                        deadline=deadline,
+                    ),
+                }
+            )
+            cursor = conn.execute(
+                f"""
+                UPDATE runs
+                SET state = 'queued',
+                    claimed_at = NULL,
+                    admitted_at = NULL,
+                    runtime_invoked_at = NULL,
+                    active_attempt_id = '',
+                    ended_at = NULL,
+                    retry_after = :retry_after,
+                    retry_attempts = COALESCE(retry_attempts, 0) + :retry_attempt_increment,
+                    capacity_retry_count = COALESCE(capacity_retry_count, 0)
+                        + :capacity_retry_increment,
+                    last_retry_class = :last_retry_class,
+                    error_text = :error_text,
+                    capacity_class = :capacity_class,
+                    capacity_available_json = :capacity_available_json,
+                    capacity_required_json = :capacity_required_json,
+                    capacity_shortage_json = :capacity_shortage_json,
+                    capacity_reservation_json = :capacity_reservation_json,
+                    capacity_next_retry_at = :capacity_next_retry_at,
+                    queue_blocker_class = :queue_blocker_class,
+                    queue_wait_episode = :queue_wait_episode,
+                    queue_wait_open = :queue_wait_open,
+                    queue_wait_generation = :queue_wait_generation,
+                    queue_wait_started_at = :queue_wait_started_at,
+                    queue_wait_closed_at = :queue_wait_closed_at,
+                    queue_wait_duration_seconds = :queue_wait_duration_seconds,
+                    queue_deadline_at = :queue_deadline_at,
+                    queue_next_status_at = :queue_next_status_at,
+                    queue_transition_emitted = :queue_transition_emitted,
+                    queue_status_sequence = :queue_status_sequence,
+                    queue_callback_state = :queue_callback_state,
+                    queue_terminal_callback_id = :queue_terminal_callback_id{failure_assignments}
+                WHERE run_id = :run_id
+                  AND state IN ('queued', 'claimed', 'admitted', 'running')
+                  AND active_attempt_id = :expected_attempt_id
+                """,
+                update_fields,
+            )
+            if cursor.rowcount:
+                if attempt_id:
+                    conn.execute(
+                        """
+                        UPDATE host_run_leases
+                        SET status = 'released', released_at = ?,
+                            release_reason = ?,
+                            reconciled_at = COALESCE(reconciled_at, ?)
+                        WHERE run_id = ? AND lease_id = ? AND attempt_id = ?
+                          AND executor_id = ? AND startup_token = ?
+                          AND status = 'active'
+                        """,
+                        (
+                            observed_at,
+                            f"run_requeued:{blocker_class}",
+                            observed_at,
+                            str(run_id),
+                            expected_generation["lease_id"],
+                            attempt_id,
+                            expected_generation["executor_id"],
+                            expected_generation["startup_token"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE host_run_leases
+                        SET status = 'released', released_at = ?,
+                            release_reason = ?,
+                            reconciled_at = COALESCE(reconciled_at, ?)
+                        WHERE run_id = ? AND status = 'active'
+                          AND attempt_id = ''
+                        """,
+                        (
+                            observed_at,
+                            f"run_requeued:{blocker_class}",
+                            observed_at,
+                            str(run_id),
+                        ),
+                    )
+            if cursor.rowcount and attempt_id:
+                update_fields["attempt_id"] = attempt_id
+                conn.execute(
+                    """
+                    UPDATE run_attempts
+                    SET state = 'retry_queued', ended_at = :attempt_ended_at,
+                        capacity_class = :capacity_class,
+                        capacity_available_json = :capacity_available_json,
+                        capacity_required_json = :capacity_required_json,
+                        capacity_shortage_json = :capacity_shortage_json,
+                        capacity_reservation_json = :capacity_reservation_json,
+                        capacity_next_retry_at = :capacity_next_retry_at,
+                        terminal_reason = :last_retry_class
+                    WHERE attempt_id = :attempt_id AND ended_at IS NULL
+                    """,
+                    update_fields,
+                )
+                self._append_attempt_trace_conn(
+                    conn, attempt_id=attempt_id, created_at=observed_at
+                )
+            latest_capacity = conn.execute(
+                "SELECT capacity_class FROM capacity_attempts "
+                "WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            same_capacity_episode = bool(
+                wait_open
+                and latest_capacity is not None
+            )
+            if (
+                cursor.rowcount
+                and str(capacity_class or "").strip()
+                and not same_capacity_episode
+            ):
+                sequence = int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                        "FROM capacity_attempts WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()[0]
+                )
+                capacity_attempt_id = "cap_" + hashlib.sha256(
+                    f"{run_id}:{sequence}".encode("utf-8")
+                ).hexdigest()
+                conn.execute(
+                    """
+                    INSERT INTO capacity_attempts (
+                        capacity_attempt_id, run_id, sequence, attempt_id,
+                        capacity_class, available_json, required_json,
+                        shortage_json, reservation_json, next_retry_at, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        capacity_attempt_id,
+                        run_id,
+                        sequence,
+                        attempt_id,
+                        str(capacity_class),
+                        update_fields["capacity_available_json"],
+                        update_fields["capacity_required_json"],
+                        update_fields["capacity_shortage_json"],
+                        update_fields["capacity_reservation_json"],
+                        update_fields["capacity_next_retry_at"],
+                        observed_at,
+                    ),
+                )
+                self._append_capacity_trace_conn(
+                    conn, capacity_attempt_id=capacity_attempt_id
+                )
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            conn.execute("COMMIT")
+        return self._row(row) if cursor.rowcount else None
+
+    def switch_worker_profile_and_requeue_run(
+        self,
+        *,
+        worker_id: str,
+        run_id: str,
+        expected_profile: str,
+        fallback_profile: str,
+        fallback_backend: str,
+        fallback_runtime: str,
+        fallback_model: str,
+        retry_after: str,
+        error_text: str,
+        route_cooldown_until: str = "",
+        route_failure_class: str = "",
+        route_source_runtime: str = "",
+        route_source_model: str = "",
+        fallback_bootstrap_bundle: dict[str, Any] | None = None,
+        **failure_fields: Any,
+    ) -> dict[str, Any] | None:
+        """Atomically move one untouched Parallel run to its trusted fallback profile."""
+
+        normalized_failure_fields = _normalized_failure_fields(failure_fields)
+        observed_at = utc_now()
+        params = {
+            "worker_id": worker_id,
+            "run_id": run_id,
+            "expected_profile": expected_profile,
+            "fallback_profile": fallback_profile,
+            "fallback_backend": fallback_backend,
+            "fallback_runtime": fallback_runtime,
+            "fallback_model": fallback_model,
+            "retry_after": retry_after,
+            "error_text": error_text,
+            "route_cooldown_until": str(route_cooldown_until or "") or None,
+            "route_failure_class": str(
+                route_failure_class
+                or normalized_failure_fields.get("failure_class")
+                or "provider_quota_exhausted"
+            ),
+            "source_runtime": str(route_source_runtime or ""),
+            "source_model": str(route_source_model or ""),
+            "last_retry_class": str(
+                normalized_failure_fields.get("failure_class")
+                or "provider_quota_exhausted"
+            ),
+            "updated_at": observed_at,
+            "attempt_ended_at": observed_at,
+            "queue_next_status_at": (
+                _parse_utc(observed_at)
+                + timedelta(seconds=_queue_status_refresh_interval_seconds())
+            ).isoformat(),
+            **normalized_failure_fields,
+        }
+        failure_assignments = "".join(
+            f", {key} = :{key}" for key in normalized_failure_fields
+        )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            worker = self._require_worker_work_admission(
+                conn.execute(
+                    "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
+                ).fetchone()
+            )
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ? AND worker_id = ?",
+                (run_id, worker_id),
+            ).fetchone()
+            if (
+                run is None
+                or str(run["state"] or "") not in {"claimed", "admitted", "running"}
+                or str(worker["profile"] or "") != expected_profile
+                or bool(int(run["provider_liveness_route_locked"] or 0))
+            ):
+                conn.execute("COMMIT")
+                return None
+            # Keep the configured fallback model and its exact effort in the
+            # same atomic route transition. A later refresh must not restore
+            # the primary route from stale bootstrap data.
+            bundle = json.loads(str(worker["bootstrap_bundle_json"] or "{}"))
+            effort_key = {
+                "codex-cli": "WPR_CODEX_CLI_REASONING_EFFORT",
+                "claude-code": "WPR_CLAUDE_CODE_EFFORT",
+            }.get(fallback_profile)
+            selected_env = (fallback_bootstrap_bundle or {}).get("env") or {}
+            if effort_key and effort_key in selected_env:
+                bundle["env"] = {
+                    **dict(bundle.get("env") or {}),
+                    effort_key: selected_env[effort_key],
+                }
+            bundle["provider_model"] = fallback_model
+            params["bootstrap_bundle_json"] = json.dumps(bundle)
+            wait_open = bool(run["queue_wait_open"])
+            generation = max(1, int(run["queue_wait_generation"] or 0))
+            if not wait_open:
+                generation += 1
+                wait_started_at = observed_at
+                deadline = (
+                    _parse_utc(observed_at)
+                    + timedelta(seconds=_queue_wait_timeout_seconds())
+                ).isoformat()
+                transition_emitted = 0
+                status_sequence = 0
+                callback_state = "unknown"
+            else:
+                wait_started_at = str(
+                    run["queue_wait_started_at"] or run["first_queued_at"]
+                )
+                deadline = str(run["queue_deadline_at"] or "")
+                transition_emitted = int(run["queue_transition_emitted"] or 0)
+                status_sequence = int(run["queue_status_sequence"] or 0)
+                callback_state = str(run["queue_callback_state"] or "unknown")
+                params["queue_next_status_at"] = run["queue_next_status_at"]
+            params.update(
+                {
+                    "queue_wait_generation": generation,
+                    "queue_wait_started_at": wait_started_at,
+                    "queue_deadline_at": deadline,
+                    "queue_transition_emitted": transition_emitted,
+                    "queue_status_sequence": status_sequence,
+                    "queue_callback_state": callback_state,
+                    "queue_terminal_callback_id": _queue_callback_id(
+                        "timeout",
+                        run_id=str(run_id),
+                        generation=generation,
+                        deadline=deadline,
+                    ),
+                }
+            )
+            params["source_runtime"] = (
+                params["source_runtime"] or str(worker["runtime"] or "")
+            )
+            params["source_model"] = (
+                params["source_model"] or str(worker["model"] or "")
+            )
+            conn.execute(
+                """
+                UPDATE workers
+                SET profile = :fallback_profile,
+                    backend = :fallback_backend,
+                    runtime = :fallback_runtime,
+                    model = :fallback_model,
+                    bootstrap_bundle_json = :bootstrap_bundle_json,
+                    session_key = NULL,
+                    state = 'ready',
+                    last_error = '',
+                    updated_at = :updated_at
+                WHERE worker_id = :worker_id
+                  AND profile = :expected_profile
+                """,
+                params,
+            )
+            if conn.total_changes == 0:
+                conn.execute("ROLLBACK")
+                return None
             conn.execute(
                 f"""
                 UPDATE runs
                 SET state = 'queued',
+                    claimed_at = NULL,
+                    admitted_at = NULL,
+                    runtime_invoked_at = NULL,
+                    active_attempt_id = '',
                     ended_at = NULL,
                     retry_after = :retry_after,
-                    retry_attempts = COALESCE(retry_attempts, 0) + 1,
                     last_retry_class = :last_retry_class,
-                    error_text = :error_text{failure_assignments}
+                    error_text = :error_text,
+                    native_session_id = '',
+                    native_capabilities_json = '{{}}',
+                    native_child_summary_json = '{{}}',
+                    provider_route_profile = :fallback_profile,
+                    provider_route_runtime = :fallback_runtime,
+                    provider_route_model = :fallback_model,
+                    provider_route_decision = 'fallback_selected',
+                    provider_route_from_profile = :expected_profile,
+                    provider_route_from_runtime = :source_runtime,
+                    provider_route_from_model = :source_model,
+                    provider_route_failure_class = :route_failure_class,
+                    provider_route_cooldown_until = :route_cooldown_until,
+                    queue_wait_episode = :queue_wait_generation,
+                    queue_wait_open = 1,
+                    queue_wait_generation = :queue_wait_generation,
+                    queue_wait_started_at = :queue_wait_started_at,
+                    queue_wait_closed_at = NULL,
+                    queue_wait_duration_seconds = NULL,
+                    queue_deadline_at = :queue_deadline_at,
+                    queue_blocker_class = :route_failure_class,
+                    queue_next_status_at = :queue_next_status_at,
+                    queue_transition_emitted = :queue_transition_emitted,
+                    queue_status_sequence = :queue_status_sequence,
+                    queue_callback_state = :queue_callback_state,
+                    queue_terminal_callback_id = :queue_terminal_callback_id{failure_assignments}
                 WHERE run_id = :run_id
-                  AND state IN ('queued', 'running')
+                  AND worker_id = :worker_id
+                  AND state IN ('claimed', 'admitted', 'running')
                 """,
-                update_fields,
+                params,
             )
+            attempt_id = str(run["active_attempt_id"] or "")
+            conn.execute(
+                """
+                UPDATE host_run_leases
+                SET status = 'released', released_at = ?,
+                    release_reason = ?, reconciled_at = COALESCE(reconciled_at, ?)
+                WHERE run_id = ? AND status = 'active'
+                """,
+                (
+                    observed_at,
+                    f"run_requeued:{params['route_failure_class']}",
+                    observed_at,
+                    str(run_id),
+                ),
+            )
+            if attempt_id:
+                conn.execute(
+                    """
+                    UPDATE run_attempts
+                    SET state = 'retry_queued', ended_at = ?,
+                        terminal_reason = ?
+                    WHERE attempt_id = ? AND ended_at IS NULL
+                    """,
+                    (
+                        params["attempt_ended_at"],
+                        params["last_retry_class"],
+                        attempt_id,
+                    ),
+                )
+                self._append_attempt_trace_conn(
+                    conn, attempt_id=attempt_id, created_at=observed_at
+                )
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None or str(row["state"] or "") != "queued":
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute("COMMIT")
         return self._row(row)
+
+    @staticmethod
+    def _run_generation_is_exact_conn(
+        conn: sqlite3.Connection,
+        run: sqlite3.Row,
+        *,
+        expected_attempt_id: str,
+        expected_lease_id: str,
+        expected_executor_id: str,
+        expected_startup_token: str,
+        expected_runtime_invoked_at: str,
+    ) -> bool:
+        run_id = str(run["run_id"] or "")
+        attempt_id = str(run["active_attempt_id"] or "")
+        expected_generation = {
+            "attempt_id": str(expected_attempt_id or ""),
+            "lease_id": str(expected_lease_id or ""),
+            "executor_id": str(expected_executor_id or ""),
+            "startup_token": str(expected_startup_token or ""),
+            "runtime_invoked_at": str(expected_runtime_invoked_at or ""),
+        }
+        if not attempt_id:
+            return not any(expected_generation.values())
+        attempt = conn.execute(
+            "SELECT * FROM run_attempts WHERE run_id = ? AND attempt_id = ?",
+            (run_id, attempt_id),
+        ).fetchone()
+        lease = conn.execute(
+            """
+            SELECT * FROM host_run_leases
+            WHERE run_id = ? AND attempt_id = ? AND lease_id = ?
+            """,
+            (run_id, attempt_id, expected_generation["lease_id"]),
+        ).fetchone()
+        return bool(
+            expected_generation["attempt_id"] == attempt_id
+            and attempt is not None
+            and attempt["ended_at"] is None
+            and (
+                str(attempt["lease_id"] or "")
+                == expected_generation["lease_id"]
+                or (
+                    str(attempt["state"] or "") == "claimed"
+                    and not str(attempt["lease_id"] or "")
+                    and not expected_generation["runtime_invoked_at"]
+                )
+            )
+            and str(attempt["runtime_invoked_at"] or "")
+            == expected_generation["runtime_invoked_at"]
+            and str(run["runtime_invoked_at"] or "")
+            == expected_generation["runtime_invoked_at"]
+            and (
+                (
+                    lease is not None
+                    and str(lease["executor_id"] or "")
+                    == expected_generation["executor_id"]
+                    and str(lease["startup_token"] or "")
+                    == expected_generation["startup_token"]
+                )
+                or (
+                    lease is None
+                    and not str(attempt["lease_id"] or "")
+                    and not expected_generation["lease_id"]
+                    and not expected_generation["executor_id"]
+                    and not expected_generation["startup_token"]
+                    and not expected_generation["runtime_invoked_at"]
+                )
+            )
+        )
+
+    def settle_run_if_current(
+        self,
+        run_id: str,
+        *,
+        output_text: str,
+        native_child_summary_json: str,
+        expected_attempt_id: str = "",
+        expected_lease_id: str = "",
+        expected_executor_id: str = "",
+        expected_startup_token: str = "",
+        expected_runtime_invoked_at: str = "",
+    ) -> dict[str, Any] | None:
+        """Enter native settling only for one exact active attempt generation."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+            if (
+                run is None
+                or str(run["state"] or "") != "running"
+                or not self._run_generation_is_exact_conn(
+                    conn,
+                    run,
+                    expected_attempt_id=expected_attempt_id,
+                    expected_lease_id=expected_lease_id,
+                    expected_executor_id=expected_executor_id,
+                    expected_startup_token=expected_startup_token,
+                    expected_runtime_invoked_at=expected_runtime_invoked_at,
+                )
+            ):
+                conn.execute("COMMIT")
+                return None
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?", (run["worker_id"],)
+            ).fetchone()
+            if worker is not None and self._run_is_owned_by_destructive_claim(
+                worker, str(run_id)
+            ):
+                conn.execute("COMMIT")
+                return None
+            self._require_worker_work_admission(worker)
+            cursor = conn.execute(
+                """
+                UPDATE runs
+                SET state = 'settling', output_text = ?,
+                    native_child_summary_json = ?
+                WHERE run_id = ? AND state = 'running'
+                  AND active_attempt_id = ?
+                  AND COALESCE(runtime_invoked_at, '') = ?
+                """,
+                (
+                    str(output_text),
+                    str(native_child_summary_json),
+                    str(run_id),
+                    str(run["active_attempt_id"] or ""),
+                    str(run["runtime_invoked_at"] or ""),
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(updated) if cursor.rowcount else None
+
+    def update_native_settling_summary_if_current(
+        self,
+        run_id: str,
+        *,
+        native_child_summary_json: str,
+        expected_attempt_id: str = "",
+        expected_lease_id: str = "",
+        expected_executor_id: str = "",
+        expected_startup_token: str = "",
+        expected_runtime_invoked_at: str = "",
+    ) -> dict[str, Any] | None:
+        """Update native projection only while the same attempt owns settling."""
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+            if (
+                run is None
+                or str(run["state"] or "") != "settling"
+                or not self._run_generation_is_exact_conn(
+                    conn,
+                    run,
+                    expected_attempt_id=expected_attempt_id,
+                    expected_lease_id=expected_lease_id,
+                    expected_executor_id=expected_executor_id,
+                    expected_startup_token=expected_startup_token,
+                    expected_runtime_invoked_at=expected_runtime_invoked_at,
+                )
+            ):
+                conn.execute("COMMIT")
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE runs SET native_child_summary_json = ?
+                WHERE run_id = ? AND state = 'settling'
+                  AND active_attempt_id = ?
+                  AND COALESCE(runtime_invoked_at, '') = ?
+                """,
+                (
+                    str(native_child_summary_json),
+                    str(run_id),
+                    str(run["active_attempt_id"] or ""),
+                    str(run["runtime_invoked_at"] or ""),
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
+            ).fetchone()
+            conn.execute("COMMIT")
+        return self._row(updated) if cursor.rowcount else None
 
     def finalize_run(
         self,
@@ -6546,12 +10474,19 @@ class Store:
             )
             return updated
         normalized_failure_fields = _normalized_failure_fields(failure_fields)
+        cancellation_retry_fields = (
+            {"retry_attempts": 0, "last_retry_class": ""}
+            if state == "cancelled"
+            else {}
+        )
         update_fields = {
             "state": state,
             "ended_at": utc_now(),
             "output_text": output_text,
             "error_text": error_text,
+            "retry_after": None,
             **normalized_failure_fields,
+            **cancellation_retry_fields,
             "run_id": run_id,
             "expected_state": expected_state,
         }
@@ -6560,6 +10495,55 @@ class Store:
         failure_assignments = "".join(f", {key} = :{key}" for key in normalized_failure_fields.keys())
         usage_assignments = "".join(f", {key} = :{key}" for key in normalized_usage.keys())
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                conn.execute("COMMIT")
+                return None
+            attempt_id = str(run["active_attempt_id"] or "")
+            if not self._run_generation_is_exact_conn(
+                conn,
+                run,
+                expected_attempt_id=expected_attempt_id,
+                expected_lease_id=expected_lease_id,
+                expected_executor_id=expected_executor_id,
+                expected_startup_token=expected_startup_token,
+                expected_runtime_invoked_at=expected_runtime_invoked_at,
+            ):
+                conn.execute("COMMIT")
+                return None
+            worker = conn.execute(
+                "SELECT * FROM workers WHERE worker_id = ?", (run["worker_id"],)
+            ).fetchone()
+            terminal_artifact_refs = self._canonical_artifact_refs(
+                artifact_refs
+                if artifact_refs is not None
+                else work_artifact_observation(
+                    self._row(worker),
+                    self._row(run),
+                    output_text=output_text,
+                    error_text=error_text,
+                )
+            )
+            if state == "running" and not self._running_generation_is_exact_conn(
+                conn, run_id, now=utc_now()
+            ):
+                conn.execute("COMMIT")
+                return None
+            if (
+                worker is not None
+                and self._run_is_owned_by_destructive_claim(worker, run_id)
+                and state not in TERMINAL_RUN_STATES
+            ):
+                conn.execute("COMMIT")
+                return None
+            if state in NONTERMINAL_RUN_STATES:
+                self._require_worker_work_admission(
+                    worker
+                )
             cur = conn.execute(
                 f"""
                 UPDATE runs
@@ -6567,8 +10551,14 @@ class Store:
                     error_text = :error_text, runtime_bundle_json = NULL
                     {failure_assignments}{usage_assignments}
                 WHERE run_id = :run_id AND state = :expected_state
+                  AND active_attempt_id = :expected_attempt_id
+                  AND COALESCE(runtime_invoked_at, '') = :expected_runtime_invoked_at
                 """,
-                update_fields,
+                {
+                    **update_fields,
+                    "expected_attempt_id": attempt_id,
+                    "expected_runtime_invoked_at": str(run["runtime_invoked_at"] or ""),
+                },
             )
             if cur.rowcount and state in TERMINAL_RUN_STATES:
                 self._finalize_linked_schedule_for_terminal_run_conn(
@@ -6579,29 +10569,82 @@ class Store:
                     terminal_at=str(update_fields["ended_at"]),
                 )
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            conn.execute("COMMIT")
         updated = self._row(row)
         if cur.rowcount and updated:
             return updated
         return None
 
     def cancel_pending_runs(self, worker_id: str, error_text: str, state: str = "cancelled") -> int:
+        if state not in TERMINAL_RUN_STATES:
+            raise ValueError("Pending work may only be cancelled into a terminal state")
+        ended_at = utc_now()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            terminal_rows = conn.execute(
+                """
+                SELECT run_id FROM runs
+                WHERE worker_id = ?
+                  AND state IN (
+                      'queued', 'claimed', 'admitted', 'running',
+                      'settling', 'paused', 'needs_input'
+                  )
+                ORDER BY run_id
+                """,
+                (worker_id,),
+            ).fetchall()
+            open_attempts = conn.execute(
+                """
+                SELECT run_attempts.attempt_id
+                FROM run_attempts
+                JOIN runs ON runs.run_id = run_attempts.run_id
+                WHERE runs.worker_id = ? AND run_attempts.ended_at IS NULL
+                ORDER BY run_attempts.run_id, run_attempts.attempt_number
+                """,
+                (worker_id,),
+            ).fetchall()
             schedule_state = "cancelled" if state == "cancelled" else "failed"
             conn.execute(
                 """
                 UPDATE scheduled_runs
                 SET state = ?, last_error = ?, updated_at = ?
                 WHERE queued_run_id IN (
-                    SELECT run_id FROM runs WHERE worker_id = ? AND state IN ('queued', 'running')
+                    SELECT run_id FROM runs WHERE worker_id = ? AND state IN (
+                        'queued', 'claimed', 'admitted', 'running',
+                        'settling', 'paused', 'needs_input'
+                    )
                 )
                   AND state IN ('queued', 'running')
                 """,
-                (schedule_state, error_text, utc_now(), worker_id),
+                (schedule_state, error_text, ended_at, worker_id),
             )
             cur = conn.execute(
                 "UPDATE runs SET state = ?, ended_at = ?, error_text = ?, runtime_bundle_json = NULL WHERE worker_id = ? AND state IN ('queued', 'running')",
                 (state, utc_now(), error_text, worker_id),
             )
+            conn.execute(
+                """
+                UPDATE run_attempts
+                SET state = ?, ended_at = ?, terminal_reason = ?
+                WHERE run_id IN (
+                    SELECT run_id FROM runs WHERE worker_id = ?
+                ) AND ended_at IS NULL
+                """,
+                (state, ended_at, state, worker_id),
+            )
+            for attempt in open_attempts:
+                self._append_attempt_trace_conn(
+                    conn,
+                    attempt_id=str(attempt["attempt_id"]),
+                    created_at=ended_at,
+                )
+            for terminal_row in terminal_rows:
+                self._record_terminal_artifact_trace_conn(
+                    conn,
+                    run_id=str(terminal_row["run_id"]),
+                    observed_at=ended_at,
+                )
+            conn.execute("COMMIT")
         return cur.rowcount
 
     @staticmethod
@@ -7545,6 +11588,7 @@ class Store:
                 """,
                 data,
             )
+            conn.execute("COMMIT")
         return data
 
     def create_or_get_cortex_workspace_schedule(
@@ -7970,6 +12014,317 @@ class Store:
             )
         return data
 
+    def add_event_once(
+        self,
+        *,
+        event_id: str,
+        project_id: str,
+        worker_id: str,
+        run_id: str | None,
+        event_type: str,
+        message: str,
+        tenant_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not str(event_id or "").strip():
+            raise ValueError("Event insertion requires a deterministic identity")
+        if not tenant_id:
+            worker = self.get_worker(worker_id) or {}
+            project = self.get_project(project_id) or {}
+            tenant_id = str(
+                worker.get("tenant_id") or project.get("tenant_id") or "local"
+            )
+        data = {
+            "event_id": str(event_id),
+            "project_id": str(project_id),
+            "worker_id": str(worker_id),
+            "tenant_id": str(tenant_id),
+            "run_id": run_id,
+            "event_type": str(event_type),
+            "message": str(message),
+            "payload_json": json.dumps(
+                payload or {}, ensure_ascii=False, sort_keys=True
+            ),
+            "created_at": utc_now(),
+        }
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO events (
+                    event_id, project_id, worker_id, tenant_id, run_id,
+                    event_type, message, payload_json, created_at
+                ) VALUES (
+                    :event_id, :project_id, :worker_id, :tenant_id, :run_id,
+                    :event_type, :message, :payload_json, :created_at
+                )
+                """,
+                data,
+            )
+            row = conn.execute(
+                "SELECT * FROM events WHERE event_id = ?", (str(event_id),)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Durable event insertion failed")
+        return dict(row)
+
+    def record_worker_isolation_audits(
+        self, observations: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Atomically bind immutable isolation audits to exact active owner leases."""
+
+        if not isinstance(observations, list) or not observations or len(observations) > 32:
+            raise ValueError("Worker isolation audit requires exact observations")
+        if len(
+            {
+                (
+                    str(item.get("tenant_id") or ""),
+                    str(item.get("owner_id") or ""),
+                )
+                for item in observations
+                if isinstance(item, dict)
+            }
+        ) != 1:
+            raise ValueError("Worker isolation audit cannot cross owner scopes")
+
+        def fingerprint(kind: str, value: object) -> str:
+            return "sha256:" + hashlib.sha256(
+                f"{kind}\0{str(value or '').strip()}".encode("utf-8")
+            ).hexdigest()
+
+        all_work_hashes = {
+            fingerprint("work", observation.get("work_ref"))
+            for observation in observations
+            if isinstance(observation, dict)
+        }
+        if len(all_work_hashes) != len(observations):
+            raise ValueError("Worker isolation audit duplicates mission scope")
+        required_fields = {
+            "contractVersion",
+            "producerScope",
+            "ownerRefHash",
+            "workRefHash",
+            "runRefHash",
+            "workerRefHash",
+            "attemptRefHash",
+            "leaseRefHash",
+            "containerRefHash",
+            "workspaceRefHash",
+            "homeRefHash",
+            "networkRefHash",
+            "pidNamespaceRefHash",
+            "executionMode",
+            "hostStateReadable",
+            "serviceEnvironmentReadable",
+            "dockerSocketReadable",
+            "ambientAuthority",
+            "peerAccessDenied",
+            "hostAccessDenied",
+            "peerProbes",
+        }
+        now = utc_now()
+        inserted: list[dict[str, Any]] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for observation in observations:
+                if not isinstance(observation, dict):
+                    raise ValueError("Worker isolation audit scope is invalid")
+                payload = observation.get("payload")
+                event_id = str(observation.get("event_id") or "")
+                trace_event_id = str(observation.get("trace_event_id") or "")
+                if (
+                    not isinstance(payload, dict)
+                    or not event_id.startswith("evt_isolation_")
+                    or trace_event_id != "trace_" + event_id.removeprefix("evt_")
+                ):
+                    raise ValueError("Worker isolation audit identity is invalid")
+                scope = conn.execute(
+                    """
+                    SELECT d.project_id, d.worker_id, d.current_run_id,
+                           d.tenant_id, d.owner_id, r.active_attempt_id,
+                           l.lease_id, l.startup_container_id,
+                           COALESCE(NULLIF(w.workspace_root, ''), w.workspace_dir)
+                               AS workspace_root
+                    FROM delegations d
+                    JOIN workers w
+                      ON w.worker_id = d.worker_id
+                     AND w.project_id = d.project_id
+                     AND w.tenant_id = d.tenant_id
+                     AND w.owner_id = d.owner_id
+                    JOIN runs r
+                      ON r.run_id = d.current_run_id
+                     AND r.worker_id = d.worker_id
+                     AND r.project_id = d.project_id
+                     AND r.tenant_id = d.tenant_id
+                    JOIN run_attempts a
+                      ON a.attempt_id = r.active_attempt_id
+                     AND a.run_id = r.run_id
+                    JOIN host_run_leases l
+                      ON l.lease_id = a.lease_id
+                     AND l.attempt_id = a.attempt_id
+                     AND l.run_id = r.run_id
+                     AND l.worker_id = d.worker_id
+                     AND l.tenant_id = d.tenant_id
+                     AND l.owner_id = d.owner_id
+                    WHERE d.work_ref = ? AND d.tenant_id = ? AND d.owner_id = ?
+                      AND d.worker_id = ? AND d.project_id = ?
+                      AND d.current_run_id = ? AND r.state = 'running'
+                      AND r.runtime_invoked_at IS NOT NULL AND r.ended_at IS NULL
+                      AND r.active_attempt_id = ? AND a.state = 'running'
+                      AND a.runtime_invoked_at = r.runtime_invoked_at
+                      AND a.ended_at IS NULL AND l.lease_id = ?
+                      AND l.status = 'active' AND l.expires_at > ?
+                      AND l.startup_state = 'confirmed'
+                      AND l.startup_identity_kind = 'docker_session'
+                      AND l.startup_container_id = ?
+                    """,
+                    (
+                        str(observation.get("work_ref") or ""),
+                        str(observation.get("tenant_id") or ""),
+                        str(observation.get("owner_id") or ""),
+                        str(observation.get("worker_id") or ""),
+                        str(observation.get("project_id") or ""),
+                        str(observation.get("run_id") or ""),
+                        str(observation.get("attempt_id") or ""),
+                        str(observation.get("lease_id") or ""),
+                        now,
+                        str(observation.get("container_id") or ""),
+                    ),
+                ).fetchone()
+                if scope is None:
+                    raise RuntimeError("Worker isolation audit lost its exact owner generation")
+                expected_hashes = {
+                    "ownerRefHash": fingerprint("owner", scope["owner_id"]),
+                    "workRefHash": fingerprint("work", observation["work_ref"]),
+                    "runRefHash": fingerprint("run", scope["current_run_id"]),
+                    "workerRefHash": fingerprint("worker", scope["worker_id"]),
+                    "attemptRefHash": fingerprint("attempt", scope["active_attempt_id"]),
+                    "leaseRefHash": fingerprint("lease", scope["lease_id"]),
+                    "containerRefHash": fingerprint(
+                        "container", scope["startup_container_id"]
+                    ),
+                    "workspaceRefHash": fingerprint(
+                        "workspace", Path(str(scope["workspace_root"] or "")).resolve()
+                    ),
+                    "pidNamespaceRefHash": fingerprint(
+                        "pid_namespace", scope["startup_container_id"]
+                    ),
+                }
+                peers = payload.get("peerProbes")
+                if (
+                    set(payload) != required_fields
+                    or payload.get("contractVersion") != 1
+                    or payload.get("producerScope") != "glasshive.worker_isolation"
+                    or any(payload.get(field) != value for field, value in expected_hashes.items())
+                    or any(
+                        re.fullmatch(r"sha256:[a-f0-9]{64}", str(payload.get(field) or ""))
+                        is None
+                        for field in ("homeRefHash", "networkRefHash")
+                    )
+                    or payload.get("executionMode") != "isolated_container"
+                    or any(
+                        payload.get(field) is not False
+                        for field in (
+                            "hostStateReadable",
+                            "serviceEnvironmentReadable",
+                            "dockerSocketReadable",
+                            "ambientAuthority",
+                        )
+                    )
+                    or payload.get("hostAccessDenied") is not True
+                    or not isinstance(peers, list)
+                    or payload.get("peerAccessDenied") is not bool(peers)
+                    or any(
+                        not isinstance(peer, dict)
+                        or set(peer) != {"workRefHash", "reachable"}
+                        or peer.get("reachable") is not False
+                        for peer in peers
+                    )
+                ):
+                    raise ValueError("Worker isolation audit proof is not owner-bound")
+                peer_hashes = [str(peer["workRefHash"]) for peer in peers]
+                expected_peers = sorted(all_work_hashes - {expected_hashes["workRefHash"]})
+                if peer_hashes != expected_peers:
+                    raise ValueError("Worker isolation audit peer evidence is invalid")
+                correlation = {
+                    "ownerRefHash": payload["ownerRefHash"],
+                    "workRefHash": payload["workRefHash"],
+                    "runRefHash": payload["runRefHash"],
+                    "attemptRefHash": payload["attemptRefHash"],
+                    "leaseRefHash": payload["leaseRefHash"],
+                    "containerRefHash": payload["containerRefHash"],
+                    "peers": peer_hashes,
+                }
+                digest = hashlib.sha256(
+                    json.dumps(
+                        correlation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                if event_id != f"evt_isolation_{digest}" or trace_event_id != f"trace_isolation_{digest}":
+                    raise ValueError("Worker isolation audit identity is not exact")
+                data = {
+                    "event_id": event_id,
+                    "project_id": str(scope["project_id"]),
+                    "worker_id": str(scope["worker_id"]),
+                    "tenant_id": str(scope["tenant_id"]),
+                    "run_id": str(scope["current_run_id"]),
+                    "event_type": "worker.isolation_probe",
+                    "message": "Confirmed isolated worker and mission network.",
+                    "payload_json": json.dumps(
+                        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ),
+                    "created_at": now,
+                }
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO events (
+                        event_id, project_id, worker_id, tenant_id, run_id,
+                        event_type, message, payload_json, created_at
+                    ) VALUES (
+                        :event_id, :project_id, :worker_id, :tenant_id, :run_id,
+                        :event_type, :message, :payload_json, :created_at
+                    )
+                    """,
+                    data,
+                )
+                event = conn.execute(
+                    "SELECT * FROM events WHERE event_id = ?", (event_id,)
+                ).fetchone()
+                if event is None or any(
+                    str(event[field] or "") != str(data[field] or "")
+                    for field in (
+                        "project_id",
+                        "worker_id",
+                        "tenant_id",
+                        "run_id",
+                        "event_type",
+                        "payload_json",
+                    )
+                ):
+                    raise RuntimeError("Worker isolation audit identity collides")
+                trace = self._append_work_trace_event_conn(
+                    conn,
+                    trace_event_id=trace_event_id,
+                    run_id=str(scope["current_run_id"]),
+                    work_ref=str(observation["work_ref"]),
+                    tenant_id=str(scope["tenant_id"]),
+                    owner_id=str(scope["owner_id"]),
+                    event_type="worker.isolation_probe",
+                    payload=payload,
+                    created_at=str(event["created_at"]),
+                )
+                if (
+                    str(trace["run_id"] or "") != str(scope["current_run_id"])
+                    or str(trace["work_ref"] or "") != str(observation["work_ref"])
+                    or str(trace["tenant_id"] or "") != str(scope["tenant_id"])
+                    or str(trace["owner_id"] or "") != str(scope["owner_id"])
+                    or str(trace["event_type"] or "") != "worker.isolation_probe"
+                    or json.loads(str(trace["payload_json"] or "{}")) != payload
+                ):
+                    raise RuntimeError("Worker isolation audit trace identity collides")
+                inserted.append(dict(event))
+            conn.execute("COMMIT")
+        return inserted
+
     def list_events(self, worker_id: str, tenant_id: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM events WHERE worker_id = ?"
         params: list[Any] = [worker_id]
@@ -8105,67 +12460,487 @@ class Store:
         worker = self.get_worker(worker_id) or {}
         project = self.get_project(project_id) or {}
         tenant_id = str(worker.get("tenant_id") or project.get("tenant_id") or "local")
-        data = {
+        intent = {
             "callback_id": callback_id,
             "project_id": project_id,
             "worker_id": worker_id,
             "tenant_id": tenant_id,
             "run_id": run_id,
+            "attempt_number": attempt_number,
             "event_type": event_type,
             "url": url,
             "payload_json": payload_json,
-            "status": "pending",
-            "attempts": 0,
-            "last_error": "",
-            "created_at": now,
-            "updated_at": now,
-            "delivered_at": None,
         }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO callback_outbox (
-                    callback_id, project_id, worker_id, tenant_id, run_id, event_type, url, payload_json,
-                    status, attempts, last_error, created_at, updated_at, delivered_at
-                )
-                VALUES (
-                    :callback_id, :project_id, :worker_id, :tenant_id, :run_id, :event_type, :url, :payload_json,
-                    :status, :attempts, :last_error, :created_at, :updated_at, :delivered_at
-                )
-                ON CONFLICT(callback_id) DO UPDATE SET
-                    project_id = excluded.project_id,
-                    worker_id = excluded.worker_id,
-                    tenant_id = excluded.tenant_id,
-                    run_id = excluded.run_id,
-                    event_type = excluded.event_type,
-                    url = excluded.url,
-                    payload_json = excluded.payload_json,
-                    status = 'pending',
-                    last_error = '',
-                    updated_at = excluded.updated_at,
-                    delivered_at = NULL
-                """,
-                data,
-            )
-            row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
+            row = self._insert_callback_intent_conn(conn, intent, now=now)
         return dict(row)
 
-    def mark_callback_delivered(self, callback_id: str, *, attempts: int, payload_json: str) -> dict[str, Any] | None:
+    def insert_callback_outbox_once(
+        self,
+        *,
+        callback_id: str,
+        project_id: str,
+        worker_id: str,
+        run_id: str | None,
+        attempt_number: int | None = None,
+        event_type: str,
+        url: str,
+        payload_json: str,
+    ) -> dict[str, Any]:
+        """Insert one immutable callback intent without rewinding delivery state."""
+
+        clean_callback_id = str(callback_id or "").strip()
+        if not clean_callback_id:
+            raise ValueError("Callback insertion requires a deterministic identity")
+        now = utc_now()
+        worker = self.get_worker(worker_id) or {}
+        project = self.get_project(project_id) or {}
+        tenant_id = str(
+            worker.get("tenant_id") or project.get("tenant_id") or "local"
+        )
+        intent = {
+            "callback_id": clean_callback_id,
+            "project_id": str(project_id or ""),
+            "worker_id": str(worker_id or ""),
+            "tenant_id": tenant_id,
+            "run_id": run_id,
+            "attempt_number": attempt_number,
+            "event_type": str(event_type or ""),
+            "url": str(url or ""),
+            "payload_json": str(payload_json or "{}"),
+        }
         with self._connect() as conn:
+            before = conn.total_changes
+            row = self._insert_callback_intent_conn(conn, intent, now=now)
+            inserted = conn.total_changes > before
+        if row is None:
+            raise RuntimeError("Callback outbox insertion did not persist")
+        return {**dict(row), "_inserted": inserted}
+
+    def get_callback_outbox(self, callback_id: str) -> dict[str, Any] | None:
+        """Read one durable callback intent without changing delivery state."""
+
+        clean_callback_id = str(callback_id or "").strip()
+        if not clean_callback_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM callback_outbox WHERE callback_id = ?",
+                (clean_callback_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def accept_terminal_callback_result(
+        self,
+        *,
+        receiver_scope: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply the receiver-side monotonic CAS for one terminal result."""
+
+        clean_scope = str(receiver_scope or "").strip()
+        if not clean_scope or len(clean_scope) > 256:
+            raise ValueError("Terminal callback receiver scope is invalid")
+        if not isinstance(payload, dict):
+            raise ValueError("Terminal callback receiver payload must be structured")
+        callback_id = str(payload.get("callback_id") or "").strip()
+        run_id = str(payload.get("run_id") or "").strip()
+        event_type = str(payload.get("event") or "").strip()
+        result_state = str(payload.get("result_state") or "").strip()
+        result_ended_at = str(payload.get("result_ended_at") or "").strip()
+        result_revision = payload.get("result_revision")
+        result_digest = str(payload.get("result_digest") or "").strip()
+        attempt_value = payload.get("attempt_number")
+        if attempt_value is None:
+            attempt_number = 0
+        elif (
+            isinstance(attempt_value, int)
+            and not isinstance(attempt_value, bool)
+            and attempt_value > 0
+        ):
+            attempt_number = attempt_value
+        else:
+            raise ValueError("Terminal callback attempt identity is invalid")
+        callback_terminal_state = {
+            "run.completed": "completed",
+            "run.failed": "failed",
+            "run.cancelled": "cancelled",
+            "run.interrupted": "cancelled",
+        }.get(event_type)
+        if (
+            re.fullmatch(r"cb_terminal_[0-9a-f]{64}", callback_id) is None
+            or not run_id
+            or result_state not in {"completed", "failed", "cancelled"}
+            or callback_terminal_state != result_state
+            or not result_ended_at
+            or not isinstance(result_revision, int)
+            or isinstance(result_revision, bool)
+            or result_revision < 1
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", result_digest) is None
+            or callback_id
+            != _terminal_callback_id(
+                run_id=run_id,
+                state=result_state,
+                ended_at=result_ended_at,
+                attempt_number=attempt_number,
+                result_revision=result_revision,
+                result_digest=result_digest,
+            )
+        ):
+            raise ValueError("Terminal callback result identity is invalid")
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """
+                SELECT * FROM terminal_callback_results
+                WHERE receiver_scope = ? AND run_id = ?
+                """,
+                (clean_scope, run_id),
+            ).fetchone()
+            if current is None or result_revision > int(
+                current["result_revision"] or 0
+            ):
+                status = "accepted"
+                conn.execute(
+                    """
+                    INSERT INTO terminal_callback_results (
+                        receiver_scope, run_id, callback_id, result_revision,
+                        result_digest, payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(receiver_scope, run_id) DO UPDATE SET
+                        callback_id = excluded.callback_id,
+                        result_revision = excluded.result_revision,
+                        result_digest = excluded.result_digest,
+                        payload_json = excluded.payload_json,
+                        updated_at = excluded.updated_at
+                    WHERE excluded.result_revision
+                        > terminal_callback_results.result_revision
+                    """,
+                    (
+                        clean_scope,
+                        run_id,
+                        callback_id,
+                        result_revision,
+                        result_digest,
+                        payload_json,
+                        now,
+                    ),
+                )
+                current = conn.execute(
+                    """
+                    SELECT * FROM terminal_callback_results
+                    WHERE receiver_scope = ? AND run_id = ?
+                    """,
+                    (clean_scope, run_id),
+                ).fetchone()
+            elif result_revision < int(current["result_revision"] or 0):
+                status = "superseded"
+            elif (
+                callback_id == str(current["callback_id"] or "")
+                and result_digest == str(current["result_digest"] or "")
+            ):
+                status = "idempotent"
+            else:
+                status = "conflict"
+            if current is None:
+                conn.execute("ROLLBACK")
+                raise RuntimeError("Terminal callback receiver CAS did not persist")
+            current_revision = int(current["result_revision"] or 0)
+            current_digest = str(current["result_digest"] or "")
+            current_callback_id = str(current["callback_id"] or "")
             conn.execute(
                 """
+                INSERT INTO terminal_callback_result_attempts (
+                    receiver_scope, run_id, callback_id, result_revision,
+                    result_digest, status, current_result_revision,
+                    current_result_digest, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_scope,
+                    run_id,
+                    callback_id,
+                    result_revision,
+                    result_digest,
+                    status,
+                    current_revision,
+                    current_digest,
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+        return {
+            "http_status": 200 if status in {"accepted", "idempotent"} else 409,
+            "callback_status": status,
+            "callback_id": callback_id,
+            "run_id": run_id,
+            "result_revision": result_revision,
+            "result_digest": result_digest,
+            "current_callback_id": current_callback_id,
+            "current_result_revision": current_revision,
+            "current_result_digest": current_digest,
+        }
+
+    def get_terminal_callback_result(
+        self,
+        *,
+        receiver_scope: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM terminal_callback_results
+                WHERE receiver_scope = ? AND run_id = ?
+                """,
+                (str(receiver_scope), str(run_id)),
+            ).fetchone()
+        return self._row(row)
+
+    def list_terminal_callback_result_attempts(
+        self,
+        *,
+        receiver_scope: str,
+        run_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM terminal_callback_result_attempts
+                WHERE receiver_scope = ? AND run_id = ?
+                ORDER BY attempt_id ASC
+                """,
+                (str(receiver_scope), str(run_id)),
+            ).fetchall()
+        return self._rows(rows)
+
+    @staticmethod
+    def _terminal_callback_is_current_conn(
+        conn: sqlite3.Connection,
+        callback: sqlite3.Row,
+    ) -> bool:
+        """Bind a canonical terminal callback to the current durable result."""
+
+        callback_id = str(callback["callback_id"] or "")
+        result_revision = int(callback["result_revision"] or 0)
+        result_digest = str(callback["result_digest"] or "")
+        if not callback_id.startswith("cb_terminal_"):
+            return result_revision == 0 and not result_digest
+        if result_revision < 1 or not result_digest.startswith("sha256:"):
+            return False
+        run_id = str(callback["run_id"] or "")
+        run = conn.execute(
+            "SELECT * FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            return False
+        state = str(run["state"] or "")
+        event_type = str(callback["event_type"] or "")
+        result_state = _terminal_callback_wire_state(state, event_type)
+        ended_at = str(run["ended_at"] or "")
+        attempt_number = Store._callback_attempt_number_conn(conn, run_id)
+        current_result_revision = int(run["terminal_result_revision"] or 0)
+        current_result_digest = _terminal_result_digest(run)
+        return bool(
+            state in TERMINAL_RUN_STATES
+            and bool(result_state)
+            and ended_at
+            and event_type == f"run.{state}"
+            and int(callback["attempt_number"] or 0) == attempt_number
+            and result_revision == current_result_revision
+            and result_digest == current_result_digest
+            and callback_id
+            == _terminal_callback_id(
+                run_id=run_id,
+                state=result_state,
+                ended_at=ended_at,
+                attempt_number=attempt_number,
+                result_revision=current_result_revision,
+                result_digest=current_result_digest,
+            )
+        )
+
+    def _supersede_terminal_callback_conn(
+        self,
+        conn: sqlite3.Connection,
+        callback: sqlite3.Row,
+        *,
+        now: str,
+        reason: str = "terminal_result_superseded",
+        attempts: int = 0,
+    ) -> sqlite3.Row:
+        callback_id = str(callback["callback_id"] or "")
+        conn.execute(
+            """
+            UPDATE callback_outbox
+            SET status = 'superseded',
+                attempts = attempts + ?,
+                last_error = ?,
+                updated_at = ?, delivered_at = NULL,
+                http_accepted_at = NULL,
+                delivery_lease_token = '',
+                delivery_lease_expires_at = NULL
+            WHERE callback_id = ?
+              AND status IN ('pending', 'delivering')
+            """,
+            (max(0, int(attempts)), str(reason)[:2000], now, callback_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM callback_outbox WHERE callback_id = ?",
+            (callback_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Superseded callback disappeared")
+        self._append_callback_trace_conn(conn, callback_id=callback_id)
+        return row
+
+    def callback_delivery_is_current(
+        self,
+        callback_id: str,
+        *,
+        lease_token: str,
+        delivery_generation: int,
+    ) -> bool:
+        """Recheck exact terminal result ownership immediately before HTTP."""
+
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            callback = conn.execute(
+                """
+                SELECT * FROM callback_outbox
+                WHERE callback_id = ? AND status = 'delivering'
+                  AND delivery_lease_token = ? AND delivery_generation = ?
+                """,
+                (
+                    str(callback_id),
+                    str(lease_token),
+                    int(delivery_generation),
+                ),
+            ).fetchone()
+            if callback is None:
+                conn.execute("COMMIT")
+                return False
+            if not self._terminal_callback_is_current_conn(conn, callback):
+                self._supersede_terminal_callback_conn(conn, callback, now=now)
+                conn.execute("COMMIT")
+                return False
+            conn.execute("COMMIT")
+        return True
+
+    def expire_callback_delivery_lease_for_local_qa(
+        self,
+        callback_id: str,
+        *,
+        lease_token: str,
+        delivery_generation: int,
+    ) -> bool:
+        """Expire only one exact sender lease so normal reclaim can rotate it."""
+
+        expired_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                """
                 UPDATE callback_outbox
-                SET status = 'delivered',
+                SET delivery_lease_expires_at = ?, updated_at = ?
+                WHERE callback_id = ? AND status = 'delivering'
+                  AND delivery_lease_token = ? AND delivery_generation = ?
+                """,
+                (
+                    expired_at,
+                    expired_at,
+                    str(callback_id),
+                    str(lease_token),
+                    int(delivery_generation),
+                ),
+            ).rowcount
+            if updated == 1:
+                self._append_callback_trace_conn(
+                    conn, callback_id=str(callback_id)
+                )
+            conn.execute("COMMIT")
+        return updated == 1
+
+    def mark_callback_http_accepted(
+        self,
+        callback_id: str,
+        *,
+        lease_token: str,
+        delivery_generation: int,
+        attempts: int,
+        payload_json: str,
+    ) -> dict[str, Any] | None:
+        accepted_at = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """
+                SELECT * FROM callback_outbox
+                WHERE callback_id = ? AND status = 'delivering'
+                  AND delivery_lease_token = ? AND delivery_generation = ?
+                """,
+                (
+                    str(callback_id),
+                    str(lease_token),
+                    int(delivery_generation),
+                ),
+            ).fetchone()
+            if current is None:
+                conn.execute("COMMIT")
+                return None
+            if not self._terminal_callback_is_current_conn(conn, current):
+                row = self._supersede_terminal_callback_conn(
+                    conn,
+                    current,
+                    now=accepted_at,
+                    attempts=attempts,
+                )
+                conn.execute("COMMIT")
+                return self._row(row)
+            accepted_at = self._strictly_after(
+                accepted_at, str(current["created_at"] or "")
+            )
+            cur = conn.execute(
+                """
+                UPDATE callback_outbox
+                SET status = 'http_accepted',
                     attempts = attempts + ?,
                     payload_json = ?,
                     last_error = '',
                     updated_at = ?,
-                    delivered_at = ?
-                WHERE callback_id = ?
+                    delivered_at = NULL,
+                    http_accepted_at = ?,
+                    delivery_lease_token = '', delivery_lease_expires_at = NULL
+                WHERE callback_id = ? AND status = 'delivering'
+                  AND delivery_lease_token = ? AND delivery_generation = ?
                 """,
-                (attempts, payload_json, utc_now(), utc_now(), callback_id),
+                (
+                    attempts,
+                    payload_json,
+                    accepted_at,
+                    accepted_at,
+                    callback_id,
+                    str(lease_token),
+                    int(delivery_generation),
+                ),
             )
+            if cur.rowcount != 1:
+                conn.execute("COMMIT")
+                return None
             row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
+            self._append_callback_trace_conn(conn, callback_id=str(callback_id))
+            conn.execute("COMMIT")
         return self._row(row)
 
     def _claim_pending_callback_parallel(
@@ -8363,19 +13138,32 @@ class Store:
                 last_error=last_error,
             )
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE callback_outbox
                 SET status = 'pending',
                     attempts = attempts + ?,
                     payload_json = ?,
                     last_error = ?,
-                    updated_at = ?
-                WHERE callback_id = ?
+                    updated_at = ?, delivery_lease_token = '',
+                    delivery_lease_expires_at = NULL
+                WHERE callback_id = ? AND status = 'delivering'
+                  AND delivery_lease_token = ? AND delivery_generation = ?
                 """,
-                (attempts, payload_json, last_error[-2000:], utc_now(), callback_id),
+                (
+                    attempts,
+                    payload_json,
+                    last_error[-2000:],
+                    utc_now(),
+                    callback_id,
+                    str(lease_token),
+                    int(delivery_generation),
+                ),
             )
+            if cur.rowcount != 1:
+                return None
             row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
+            self._append_callback_trace_conn(conn, callback_id=str(callback_id))
         return self._row(row)
 
     def _mark_callback_dead_lettered_parallel(
@@ -8437,7 +13225,7 @@ class Store:
                 last_error=last_error,
             )
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE callback_outbox
                 SET status = 'dead_lettered',
@@ -15503,113 +20291,9 @@ class Store:
             ).fetchone()
         return self._row(row)
 
-    def count_active_host_missions(self) -> int:
-        """Count durable host mission roots that could conflict with Parallel Main.
 
-        Nonterminal rows remain blockers even when paused or waiting for input:
-        policy prevents them from restarting while isolated Parallel mode is
-        enabled, but readiness must not describe that retained work as gone.
-        An active lease is included independently so a crash between state
-        transitions cannot make the capability probe optimistic.
-        """
 
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(DISTINCT worker_id)
-                FROM (
-                    SELECT workers.worker_id AS worker_id
-                    FROM workers
-                    JOIN runs ON runs.worker_id = workers.worker_id
-                    WHERE workers.execution_mode = 'host'
-                      AND workers.trusted_run_lane = 'mission'
-                      AND runs.state NOT IN (
-                          'completed', 'failed', 'cancelled', 'interrupted'
-                      )
-                    UNION
-                    SELECT leases.worker_id AS worker_id
-                    FROM host_run_leases AS leases
-                    JOIN workers ON workers.worker_id = leases.worker_id
-                    WHERE leases.status = 'active'
-                      AND workers.execution_mode = 'host'
-                      AND workers.trusted_run_lane = 'mission'
-                ) AS active_host_missions
-                """
-            ).fetchone()
-        return int(row[0] or 0)
 
-    def active_host_mission_worker_ids(self) -> set[str]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT worker_id
-                FROM (
-                    SELECT workers.worker_id AS worker_id
-                    FROM workers
-                    JOIN runs ON runs.worker_id = workers.worker_id
-                    WHERE workers.execution_mode = 'host'
-                      AND workers.trusted_run_lane = 'mission'
-                      AND runs.state NOT IN (
-                          'completed', 'failed', 'cancelled', 'interrupted'
-                      )
-                    UNION
-                    SELECT leases.worker_id AS worker_id
-                    FROM host_run_leases AS leases
-                    JOIN workers ON workers.worker_id = leases.worker_id
-                    WHERE leases.status = 'active'
-                      AND workers.execution_mode = 'host'
-                      AND workers.trusted_run_lane = 'mission'
-                )
-                """
-            ).fetchall()
-        return {str(row["worker_id"]) for row in rows}
-
-    def list_host_mission_workers(self) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM workers
-                WHERE execution_mode = 'host'
-                  AND trusted_run_lane = 'mission'
-                ORDER BY created_at ASC, worker_id ASC
-                """
-            ).fetchall()
-        return self._rows(rows)
-
-    def conclusively_terminal_host_mission_history(
-        self,
-    ) -> set[tuple[str, str]]:
-        """Return exact finished runs with no current mission or active lease."""
-
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT workers.worker_id, runs.run_id
-                FROM workers
-                JOIN runs ON runs.worker_id = workers.worker_id
-                WHERE workers.execution_mode = 'host'
-                  AND workers.trusted_run_lane = 'mission'
-                  AND runs.state IN (
-                      'completed', 'failed', 'cancelled', 'interrupted'
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM runs AS current_runs
-                      WHERE current_runs.worker_id = workers.worker_id
-                        AND current_runs.state NOT IN (
-                            'completed', 'failed', 'cancelled', 'interrupted'
-                        )
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM host_run_leases AS active_leases
-                      WHERE active_leases.worker_id = workers.worker_id
-                        AND active_leases.status = 'active'
-                  )
-                """
-            ).fetchall()
-        return {
-            (str(row["worker_id"]), str(row["run_id"]))
-            for row in rows
-        }
 
     @staticmethod
     def _lifecycle_event_id(
@@ -16670,10 +21354,16 @@ class Store:
                     and requested_kind
                     not in {
                         "resume_worker",
+                        "pause_worker",
                         "resume_run",
                         "stop_run",
                         "terminate_worker",
                     }
+                    and not (
+                        requested_kind == "steer_run"
+                        and target is not None
+                        and str(target["state"] or "") == "queued"
+                    )
                 )
             ):
                 conn.execute("COMMIT")
@@ -16858,7 +21548,9 @@ class Store:
                 else None
             )
             current_state = str(worker["state"] or "")
-            if clean_kind == "pause_worker":
+            if current_state in {"terminating", "termination_failed", "terminated"}:
+                next_state = current_state
+            elif clean_kind == "pause_worker":
                 next_state = "paused"
             elif clean_kind == "resume_worker":
                 next_state = str(idle_state)
@@ -16882,7 +21574,11 @@ class Store:
                 "token": token,
                 "epoch": int(epoch),
             }
-            if clean_kind in {"pause_worker", "resume_worker"}:
+            if (
+                clean_kind in {"pause_worker", "resume_worker"}
+                and current_state
+                not in {"terminating", "termination_failed", "terminated"}
+            ):
                 event_type = (
                     "worker.paused"
                     if clean_kind == "pause_worker"
@@ -17643,20 +22339,11 @@ class Store:
                         "SELECT * FROM run_attempts WHERE attempt_id = ? AND run_id = ?",
                         (restart_attempt_id, clean_target),
                     ).fetchone()
-                    active_restart_lease = conn.execute(
-                        """
-                        SELECT 1 FROM host_run_leases
-                        WHERE run_id = ? AND attempt_id = ? AND status = 'active'
-                        LIMIT 1
-                        """,
-                        (clean_target, restart_attempt_id),
-                    ).fetchone()
                     if (
                         restart_attempt is None
                         or restart_attempt["ended_at"] is not None
                         or str(restart_attempt["state"] or "")
                         not in {"claimed", "admitted", "running", "settling"}
-                        or active_restart_lease is not None
                     ):
                         conn.execute("COMMIT")
                         return None
@@ -17767,7 +22454,7 @@ class Store:
                     attempt_id=restart_attempt_id,
                     created_at=now,
                 )
-            if release_lease:
+            if release_lease or restart_attempt_id:
                 conn.execute(
                     """
                     UPDATE host_run_leases
@@ -17775,7 +22462,17 @@ class Store:
                         reconciled_at = COALESCE(reconciled_at, ?)
                     WHERE worker_id = ? AND run_id = ? AND status = 'active'
                     """,
-                    (now, f"{clean_kind}_confirmed", now, worker_id, clean_target),
+                    (
+                        now,
+                        (
+                            "host_pause_resume_restart"
+                            if restart_attempt_id
+                            else f"{clean_kind}_confirmed"
+                        ),
+                        now,
+                        worker_id,
+                        clean_target,
+                    ),
                 )
             event_specs = {
                 "pause_run": (
@@ -19362,24 +24059,6 @@ class Store:
             conn.execute("COMMIT")
         return self._row(created), True
 
-    @staticmethod
-    def _run_is_owned_by_destructive_claim(
-        worker: sqlite3.Row, run_id: str
-    ) -> bool:
-        return bool(
-            str(worker["compute_release_token"] or "")
-            and str(worker["compute_release_target_run_id"] or "") == str(run_id)
-            and str(worker["compute_release_kind"] or "")
-            in {
-                "pause_run",
-                "resume_run",
-                "interrupt_run",
-                "steer_run",
-                "max_duration",
-                "stop_run",
-                "terminate_worker",
-            }
-        )
 
     def list_due_retry_worker_ids(self, now_iso: str | None = None, limit: int = 1000) -> list[str]:
         now_iso = now_iso or utc_now()
@@ -19606,8 +24285,46 @@ class Store:
         event_type = str(intent.get("event_type") or "").strip()
         if not callback_id:
             raise ValueError("Callback intent requires a deterministic identity")
-        if not worker_id or not run_id or not event_type:
-            raise ValueError("Callback intent requires exact worker, run, and event identity")
+        if not worker_id or not event_type:
+            raise ValueError("Callback intent requires exact worker and event identity")
+        if not run_id:
+            if not event_type.startswith("worker."):
+                raise ValueError("Run callbacks require exact run identity")
+            worker = conn.execute(
+                "SELECT project_id, tenant_id FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if (
+                worker is None
+                or str(worker["project_id"] or "")
+                != str(intent.get("project_id") or "")
+                or str(worker["tenant_id"] or "local")
+                != str(intent.get("tenant_id") or "local")
+            ):
+                raise ValueError("Callback intent worker association is not exact")
+            try:
+                payload = json.loads(str(intent.get("payload_json") or "{}"))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Callback intent payload must be valid JSON") from exc
+            if not isinstance(payload, dict):
+                raise ValueError("Callback intent payload must be an object")
+            if (
+                intent.get("attempt_number") not in (None, 0)
+                or intent.get("result_revision") not in (None, 0)
+                or str(intent.get("result_digest") or "")
+            ):
+                raise ValueError("Runless callback cannot carry run result identity")
+            return {
+                **intent,
+                "callback_id": callback_id,
+                "worker_id": worker_id,
+                "run_id": None,
+                "event_type": event_type,
+                "attempt_number": 0,
+                "result_revision": 0,
+                "result_digest": "",
+                "payload_json": json.dumps(payload, ensure_ascii=False),
+            }
         exact_run = conn.execute(
             "SELECT * FROM runs WHERE run_id = ?",
             (run_id,),
@@ -21453,1059 +26170,21 @@ class Store:
             executor_id=str(lease.get("executor_id") or ""),
         )
 
-    def get_controllable_run(self, worker_id: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM runs
-                WHERE worker_id = ? AND state IN (
-                    'queued', 'claimed', 'admitted', 'running', 'settling', 'paused'
-                )
-                ORDER BY COALESCE(started_at, queued_at) DESC
-                LIMIT 1
-                """,
-                (worker_id,),
-            ).fetchone()
-        return self._row(row)
 
-    def list_nonterminal_runs_for_worker(self, worker_id: str) -> list[dict[str, Any]]:
-        """Return every durable mission run that still requires control or execution."""
 
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM runs
-                WHERE worker_id = ?
-                  AND state IN (
-                      'queued', 'claimed', 'admitted', 'running', 'settling', 'paused', 'needs_input'
-                  )
-                ORDER BY
-                    CASE state
-                        WHEN 'running' THEN 0
-                        WHEN 'admitted' THEN 1
-                        WHEN 'claimed' THEN 2
-                        WHEN 'settling' THEN 3
-                        WHEN 'paused' THEN 4
-                        WHEN 'needs_input' THEN 5
-                        ELSE 6
-                    END,
-                    COALESCE(started_at, queued_at) ASC,
-                    run_id ASC
-                """,
-                (worker_id,),
-            ).fetchall()
-        return self._rows(rows)
 
-    def cancel_queued_runs_for_worker(
-        self,
-        worker_id: str,
-        *,
-        error_text: str,
-        exclude_run_id: str = "",
-    ) -> list[dict[str, Any]]:
-        """Cancel pending siblings as one mission-scoped Stop subeffect."""
 
-        now = utc_now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                """
-                SELECT * FROM runs
-                WHERE worker_id = ? AND state IN ('queued', 'needs_input')
-                  AND (? = '' OR run_id != ?)
-                ORDER BY queued_at ASC, run_id ASC
-                """,
-                (worker_id, exclude_run_id, exclude_run_id),
-            ).fetchall()
-            run_ids = [str(row["run_id"]) for row in rows]
-            if run_ids:
-                placeholders = ",".join("?" for _ in run_ids)
-                conn.execute(
-                    f"""
-                    UPDATE runs
-                    SET state = 'cancelled', ended_at = ?, error_text = ?,
-                        failure_class = '', failure_retryable = 0,
-                        failure_structured = 0, failure_user_message = '',
-                        failure_recommended_recovery = '',
-                        failure_diagnostic_summary = '', retry_after = NULL,
-                        retry_attempts = 0, last_retry_class = ''
-                    WHERE run_id IN ({placeholders})
-                      AND state IN ('queued', 'needs_input')
-                    """,
-                    (now, error_text, *run_ids),
-                )
-                for cancelled_run_id in run_ids:
-                    self._record_terminal_artifact_trace_conn(
-                        conn,
-                        run_id=cancelled_run_id,
-                        observed_at=now,
-                    )
-            conn.execute("COMMIT")
-        return [
-            self.get_run(run_id)
-            for run_id in run_ids
-            if self.get_run(run_id) is not None
-        ]
 
-    def transition_run_if_state(
-        self,
-        run_id: str,
-        expected_state: str,
-        state: str,
-        **fields: Any,
-    ) -> dict[str, Any] | None:
-        if state == "cancelled":
-            for key, value in CANCELLATION_CLEAR_FIELDS.items():
-                fields.setdefault(key, value)
-        if state in TERMINAL_RUN_STATES:
-            fields.setdefault("ended_at", utc_now())
-        values = {"run_id": run_id, "expected_state": expected_state, "state": state, **fields}
-        assignments = ["state = :state"]
-        assignments.extend(f"{key} = :{key}" for key in fields)
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            run = conn.execute(
-                "SELECT * FROM runs WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-            if run is None:
-                conn.execute("COMMIT")
-                return None
-            worker = conn.execute(
-                "SELECT * FROM workers WHERE worker_id = ?", (run["worker_id"],)
-            ).fetchone()
-            if (
-                "started_at" in fields
-                and str(run["started_at"] or "")
-                and str(fields.get("started_at") or "")
-                != str(run["started_at"] or "")
-            ):
-                conn.execute("COMMIT")
-                return None
-            if state in NONTERMINAL_RUN_STATES:
-                self._require_worker_work_admission(worker)
-            if state in {"claimed", "admitted"}:
-                conn.execute("COMMIT")
-                return None
-            if state == "running" and not self._running_generation_is_exact_conn(
-                conn, run_id, now=utc_now()
-            ):
-                conn.execute("COMMIT")
-                return None
-            if (
-                worker is not None
-                and self._run_is_owned_by_destructive_claim(worker, run_id)
-                and state not in TERMINAL_RUN_STATES
-            ):
-                conn.execute("COMMIT")
-                return None
-            cursor = conn.execute(
-                f"UPDATE runs SET {', '.join(assignments)} WHERE run_id = :run_id AND state = :expected_state",
-                values,
-            )
-            if (
-                cursor.rowcount
-                and state == "running"
-                and not self._running_generation_is_exact_conn(
-                    conn, run_id, now=utc_now()
-                )
-            ):
-                conn.execute("ROLLBACK")
-                return None
-            if (
-                cursor.rowcount
-                and (state in TERMINAL_RUN_STATES or state == "needs_input")
-                and str(run["active_attempt_id"] or "")
-            ):
-                attempt_ended_at = str(fields.get("ended_at") or utc_now())
-                conn.execute(
-                    """
-                    UPDATE run_attempts
-                    SET state = ?, ended_at = ?, terminal_reason = ?
-                    WHERE attempt_id = ? AND ended_at IS NULL
-                    """,
-                    (
-                        state,
-                        attempt_ended_at,
-                        state,
-                        str(run["active_attempt_id"] or ""),
-                    ),
-                )
-                self._append_attempt_trace_conn(
-                    conn,
-                    attempt_id=str(run["active_attempt_id"] or ""),
-                    created_at=attempt_ended_at,
-                )
-            if cursor.rowcount and state in TERMINAL_RUN_STATES:
-                self._record_terminal_artifact_trace_conn(
-                    conn,
-                    run_id=str(run_id),
-                    observed_at=str(fields.get("ended_at") or utc_now()),
-                )
-            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-            conn.execute("COMMIT")
-        updated = self._row(row)
-        return updated if cursor.rowcount and updated else None
 
-    def mark_run_needs_input(
-        self,
-        run_id: str,
-        *,
-        expected_state: str = "running",
-        error_text: str,
-        failure_class: str,
-        failure_user_message: str,
-    ) -> dict[str, Any] | None:
-        return self.transition_run_if_state(
-            run_id,
-            expected_state,
-            "needs_input",
-            ended_at=None,
-            error_text=error_text,
-            retry_after=None,
-            failure_class=failure_class,
-            failure_retryable=0,
-            failure_structured=1,
-            failure_user_message=failure_user_message,
-            failure_recommended_recovery="Provide the requested authorization, then resume this work.",
-            failure_diagnostic_summary="Deferred broker admission requires user input.",
-        )
 
-    def list_terminal_runs_missing_callback_intent(
-        self,
-        *,
-        created_before: str | None = None,
-        limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        """Return terminal generations with no durable callback sink."""
 
-        result_digest_sql = "glasshive_terminal_result_digest(" + ", ".join(
-            f"runs.{field}" for field in TERMINAL_RESULT_DIGEST_FIELDS
-        ) + ")"
-        query = f"""
-            SELECT runs.*
-            FROM runs
-            JOIN workers ON workers.worker_id = runs.worker_id
-            WHERE runs.state IN ('completed', 'failed', 'cancelled', 'interrupted')
-              AND runs.ended_at IS NOT NULL
-              AND runs.ended_at != ''
-              AND workers.bootstrap_bundle_json IS NOT NULL
-              AND json_valid(workers.bootstrap_bundle_json)
-              AND COALESCE(
-                    json_extract(
-                        workers.bootstrap_bundle_json,
-                        '$.callbacks.events_webhook_url'
-                    ),
-                    json_extract(
-                        workers.bootstrap_bundle_json,
-                        '$.callbacks.url'
-                    ),
-                    ''
-                  ) != ''
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM callback_outbox
-                  WHERE callback_outbox.run_id = runs.run_id
-                    AND callback_outbox.event_type = 'run.' || runs.state
-                    AND callback_outbox.attempt_number = COALESCE(
-                        (
-                            SELECT MAX(run_attempts.attempt_number)
-                            FROM run_attempts
-                            WHERE run_attempts.run_id = runs.run_id
-                        ),
-                        0
-                    )
-                    AND (
-                        (
-                            callback_outbox.result_revision =
-                                runs.terminal_result_revision
-                            AND callback_outbox.result_digest = {result_digest_sql}
-                        )
-                        OR (
-                            substr(callback_outbox.callback_id, 1, 16) =
-                                'cb_run_terminal_'
-                            AND callback_outbox.result_revision = 0
-                            AND callback_outbox.result_digest = ''
-                        )
-                    )
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM terminal_callback_reconciliations
-                  WHERE terminal_callback_reconciliations.run_id = runs.run_id
-                    AND terminal_callback_reconciliations.state = runs.state
-                    AND terminal_callback_reconciliations.ended_at = runs.ended_at
-                    AND terminal_callback_reconciliations.attempt_number = COALESCE(
-                        (
-                            SELECT MAX(run_attempts.attempt_number)
-                            FROM run_attempts
-                            WHERE run_attempts.run_id = runs.run_id
-                        ),
-                        0
-                    )
-                    AND terminal_callback_reconciliations.callback_contract_digest =
-                        glasshive_sha256(
-                            COALESCE(workers.bootstrap_bundle_json, '')
-                        )
-                    AND terminal_callback_reconciliations.status = 'unavailable'
-              )
-        """
-        params: list[Any] = []
-        if created_before:
-            query += " AND runs.ended_at <= ?"
-            params.append(str(created_before))
-        query += " ORDER BY runs.ended_at ASC, runs.run_id ASC LIMIT ?"
-        params.append(max(1, min(int(limit), 1000)))
-        with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
-        return self._rows(rows)
 
-    def mark_terminal_callback_reconciliation_unavailable(
-        self,
-        run_id: str,
-        *,
-        expected_state: str,
-        expected_ended_at: str,
-        expected_attempt_number: int,
-        expected_callback_contract_digest: str,
-        reason_code: str,
-    ) -> dict[str, Any] | None:
-        """Classify one exact terminal callback contract as undeliverable."""
 
-        clean_reason = str(reason_code or "").strip()
-        if clean_reason not in {
-            "callback_config_missing",
-            "callback_context_incomplete",
-        }:
-            raise ValueError("Invalid terminal callback reconciliation reason")
-        now = utc_now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            current = conn.execute(
-                """
-                SELECT runs.*, workers.bootstrap_bundle_json
-                FROM runs
-                JOIN workers ON workers.worker_id = runs.worker_id
-                WHERE runs.run_id = ?
-                """,
-                (str(run_id),),
-            ).fetchone()
-            current_attempt_number = (
-                self._callback_attempt_number_conn(conn, str(run_id))
-                if current is not None
-                else 0
-            )
-            current_contract_digest = (
-                _text_sha256(current["bootstrap_bundle_json"] or "")
-                if current is not None
-                else ""
-            )
-            if (
-                current is None
-                or str(current["state"] or "") != str(expected_state or "")
-                or str(current["state"] or "") not in TERMINAL_RUN_STATES
-                or str(current["ended_at"] or "")
-                != str(expected_ended_at or "")
-                or current_attempt_number != max(0, int(expected_attempt_number))
-                or current_contract_digest
-                != str(expected_callback_contract_digest or "")
-            ):
-                conn.execute("COMMIT")
-                return None
-            conn.execute(
-                """
-                INSERT INTO terminal_callback_reconciliations (
-                    run_id, state, ended_at, attempt_number,
-                    callback_contract_digest, status, reason_code, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'unavailable', ?, ?)
-                ON CONFLICT (
-                    run_id, state, ended_at, attempt_number,
-                    callback_contract_digest
-                ) DO UPDATE SET
-                    status = 'unavailable',
-                    reason_code = excluded.reason_code,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    str(run_id),
-                    str(expected_state),
-                    str(expected_ended_at),
-                    current_attempt_number,
-                    current_contract_digest,
-                    clean_reason,
-                    now,
-                ),
-            )
-            row = conn.execute(
-                """
-                SELECT * FROM terminal_callback_reconciliations
-                WHERE run_id = ? AND state = ? AND ended_at = ?
-                  AND attempt_number = ? AND callback_contract_digest = ?
-                """,
-                (
-                    str(run_id),
-                    str(expected_state),
-                    str(expected_ended_at),
-                    current_attempt_number,
-                    current_contract_digest,
-                ),
-            ).fetchone()
-            conn.execute("COMMIT")
-        return self._row(row)
 
-    def has_queued_capacity_retry(self, worker_id: str) -> bool:
-        """Return whether restart recovery may reactivate a persisted capacity wait."""
 
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM runs
-                WHERE worker_id = ?
-                  AND state = 'queued'
-                  AND retry_after IS NOT NULL
-                  AND retry_after != ''
-                  AND failure_retryable = 1
-                  AND failure_structured = 1
-                  AND failure_class IN ('host_capacity', 'host_worker_busy')
-                  AND last_retry_class IN ('host_capacity', 'host_worker_busy')
-                LIMIT 1
-                """,
-                (worker_id,),
-            ).fetchone()
-        return row is not None
 
-    def has_queued_running_invariant_retry(self, worker_id: str) -> bool:
-        """Return whether startup recovery requeued an unowned running generation."""
 
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM runs
-                WHERE worker_id = ?
-                  AND state = 'queued'
-                  AND retry_after IS NOT NULL
-                  AND retry_after != ''
-                  AND failure_retryable = 1
-                  AND failure_structured = 1
-                  AND failure_class = 'running_invariant_reconciled'
-                  AND last_retry_class = 'running_invariant_reconciled'
-                  AND queue_blocker_class = 'running_invariant_reconciled'
-                LIMIT 1
-                """,
-                (worker_id,),
-            ).fetchone()
-        return row is not None
 
-    def reconcile_automatic_retry_worker(self, worker_id: str) -> dict[str, Any] | None:
-        """Atomically project a system retry without overriding durable pause intent."""
-
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            worker = conn.execute(
-                "SELECT * FROM workers WHERE worker_id = ?",
-                (worker_id,),
-            ).fetchone()
-            retry = conn.execute(
-                """
-                SELECT 1 FROM runs
-                WHERE worker_id = ?
-                  AND state = 'queued'
-                  AND retry_after IS NOT NULL
-                  AND retry_after != ''
-                  AND failure_retryable = 1
-                  AND failure_structured = 1
-                  AND (
-                      (
-                          failure_class IN ('host_capacity', 'host_worker_busy')
-                          AND last_retry_class IN ('host_capacity', 'host_worker_busy')
-                      )
-                      OR (
-                          failure_class = 'running_invariant_reconciled'
-                          AND last_retry_class = 'running_invariant_reconciled'
-                          AND queue_blocker_class = 'running_invariant_reconciled'
-                      )
-                  )
-                LIMIT 1
-                """,
-                (worker_id,),
-            ).fetchone()
-            if worker is None or retry is None:
-                conn.execute("COMMIT")
-                return None
-            paused_run = conn.execute(
-                """
-                SELECT 1 FROM runs
-                WHERE worker_id = ? AND state = 'paused'
-                LIMIT 1
-                """,
-                (worker_id,),
-            ).fetchone()
-            latest_control = conn.execute(
-                """
-                SELECT event_type FROM events
-                WHERE worker_id = ?
-                  AND event_type IN (
-                      'worker.paused', 'worker.resumed', 'worker.resumed_by_alias'
-                  )
-                ORDER BY rowid DESC
-                LIMIT 1
-                """,
-                (worker_id,),
-            ).fetchone()
-            operator_paused = bool(
-                latest_control is not None
-                and str(latest_control["event_type"] or "") == "worker.paused"
-            )
-            state = "paused" if paused_run is not None or operator_paused else "ready"
-            conn.execute(
-                """
-                UPDATE workers
-                SET state = ?
-                WHERE worker_id = ?
-                  AND compute_release_token = ''
-                  AND COALESCE(work_stop_id, '') = ''
-                  AND state NOT IN ('needs_input', 'stopping', 'terminated',
-                                    'terminating', 'termination_failed')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM runs AS active
-                      WHERE active.worker_id = workers.worker_id
-                        AND active.state IN ('claimed', 'admitted', 'running', 'settling')
-                  )
-                """,
-                (state, worker_id),
-            )
-            row = conn.execute(
-                "SELECT * FROM workers WHERE worker_id = ?",
-                (worker_id,),
-            ).fetchone()
-            conn.execute("COMMIT")
-        return self._row(row)
-
-    def reconcile_restart_authority_blocked_workers(
-        self,
-        *,
-        limit: int = 64,
-    ) -> list[str]:
-        """Unblock siblings behind an exact-replay-recoverable stateless turn."""
-
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                """
-                SELECT workers.worker_id
-                FROM workers
-                WHERE workers.state IN ('needs_input', 'paused')
-                  AND workers.work_stop_id = ''
-                  AND workers.compute_release_token = ''
-                  AND EXISTS (
-                      SELECT 1 FROM runs AS blocked
-                      WHERE blocked.worker_id = workers.worker_id
-                        AND blocked.state = 'needs_input'
-                        AND blocked.failure_class =
-                            'conversation_capability_grant_required'
-                        AND NOT EXISTS (
-                            SELECT 1 FROM host_run_leases
-                            WHERE host_run_leases.run_id = blocked.run_id
-                              AND host_run_leases.status = 'active'
-                        )
-                        AND EXISTS (
-                            SELECT 1 FROM provider_requests
-                            WHERE provider_requests.run_id = blocked.run_id
-                              AND provider_requests.state = 'failed'
-                              AND COALESCE(
-                                  json_extract(
-                                      provider_requests.replay_decision_json,
-                                      '$.provider_session_mode'
-                                  ),
-                                  ''
-                              ) = 'stateless'
-                        )
-                  )
-                  AND EXISTS (
-                      SELECT 1 FROM runs AS sibling
-                      WHERE sibling.worker_id = workers.worker_id
-                        AND sibling.state = 'queued'
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM runs AS paused
-                      WHERE paused.worker_id = workers.worker_id
-                        AND paused.state = 'paused'
-                  )
-                  AND COALESCE(
-                      (
-                          SELECT event_type FROM events
-                          WHERE events.worker_id = workers.worker_id
-                            AND event_type IN (
-                                'worker.paused', 'worker.resumed',
-                                'worker.resumed_by_alias'
-                            )
-                          ORDER BY rowid DESC
-                          LIMIT 1
-                      ),
-                      ''
-                  ) != 'worker.paused'
-                ORDER BY workers.worker_id
-                LIMIT ?
-                """,
-                (max(1, min(int(limit), 256)),),
-            ).fetchall()
-            worker_ids = [str(row["worker_id"]) for row in rows]
-            for worker_id in worker_ids:
-                conn.execute(
-                    """
-                    UPDATE workers
-                    SET state = 'ready'
-                    WHERE worker_id = ?
-                      AND state IN ('needs_input', 'paused')
-                      AND compute_release_token = ''
-                    """,
-                    (worker_id,),
-                )
-            conn.execute("COMMIT")
-        return worker_ids
-
-    def has_active_operator_pause(self, worker_id: str) -> bool:
-        """Return whether the latest explicit pause/resume intent is still paused."""
-
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT event_type FROM events
-                WHERE worker_id = ?
-                  AND event_type IN (
-                      'worker.paused', 'worker.resumed', 'worker.resumed_by_alias'
-                  )
-                -- Events are append-only in this local SQLite store. rowid is
-                -- the durable transition order and avoids timestamp ties.
-                ORDER BY rowid DESC
-                LIMIT 1
-                """,
-                (worker_id,),
-            ).fetchone()
-        return row is not None and str(row["event_type"] or "") == "worker.paused"
-
-    def switch_worker_profile_and_requeue_run(
-        self,
-        *,
-        worker_id: str,
-        run_id: str,
-        expected_profile: str,
-        fallback_profile: str,
-        fallback_backend: str,
-        fallback_runtime: str,
-        fallback_model: str,
-        retry_after: str,
-        error_text: str,
-        route_cooldown_until: str = "",
-        route_failure_class: str = "",
-        route_source_runtime: str = "",
-        route_source_model: str = "",
-        fallback_bootstrap_bundle: dict[str, Any] | None = None,
-        **failure_fields: Any,
-    ) -> dict[str, Any] | None:
-        """Atomically move one untouched Parallel run to its trusted fallback profile."""
-
-        normalized_failure_fields = _normalized_failure_fields(failure_fields)
-        observed_at = utc_now()
-        params = {
-            "worker_id": worker_id,
-            "run_id": run_id,
-            "expected_profile": expected_profile,
-            "fallback_profile": fallback_profile,
-            "fallback_backend": fallback_backend,
-            "fallback_runtime": fallback_runtime,
-            "fallback_model": fallback_model,
-            "retry_after": retry_after,
-            "error_text": error_text,
-            "route_cooldown_until": str(route_cooldown_until or "") or None,
-            "route_failure_class": str(
-                route_failure_class
-                or normalized_failure_fields.get("failure_class")
-                or "provider_quota_exhausted"
-            ),
-            "source_runtime": str(route_source_runtime or ""),
-            "source_model": str(route_source_model or ""),
-            "last_retry_class": str(
-                normalized_failure_fields.get("failure_class")
-                or "provider_quota_exhausted"
-            ),
-            "updated_at": observed_at,
-            "attempt_ended_at": observed_at,
-            "queue_next_status_at": (
-                _parse_utc(observed_at)
-                + timedelta(seconds=_queue_status_refresh_interval_seconds())
-            ).isoformat(),
-            **normalized_failure_fields,
-        }
-        failure_assignments = "".join(
-            f", {key} = :{key}" for key in normalized_failure_fields
-        )
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            worker = self._require_worker_work_admission(
-                conn.execute(
-                    "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
-                ).fetchone()
-            )
-            run = conn.execute(
-                "SELECT * FROM runs WHERE run_id = ? AND worker_id = ?",
-                (run_id, worker_id),
-            ).fetchone()
-            if (
-                run is None
-                or str(run["state"] or "") not in {"claimed", "admitted", "running"}
-                or str(worker["profile"] or "") != expected_profile
-                or bool(int(run["provider_liveness_route_locked"] or 0))
-            ):
-                conn.execute("COMMIT")
-                return None
-            # Persist the model source with the route in this same transaction.
-            # A later worker refresh must never restore the primary model.
-            bundle = json.loads(str(worker["bootstrap_bundle_json"] or "{}"))
-            effort_key = {
-                "codex-cli": "WPR_CODEX_CLI_REASONING_EFFORT",
-                "claude-code": "WPR_CLAUDE_CODE_EFFORT",
-            }.get(fallback_profile)
-            selected_env = (fallback_bootstrap_bundle or {}).get("env") or {}
-            if effort_key and effort_key in selected_env:
-                bundle["env"] = {
-                    **dict(bundle.get("env") or {}),
-                    effort_key: selected_env[effort_key],
-                }
-            bundle["provider_model"] = fallback_model
-            params["bootstrap_bundle_json"] = json.dumps(bundle)
-            wait_open = bool(run["queue_wait_open"])
-            generation = max(1, int(run["queue_wait_generation"] or 0))
-            if not wait_open:
-                generation += 1
-                wait_started_at = observed_at
-                deadline = (
-                    _parse_utc(observed_at)
-                    + timedelta(seconds=_queue_wait_timeout_seconds())
-                ).isoformat()
-                transition_emitted = 0
-                status_sequence = 0
-                callback_state = "unknown"
-            else:
-                wait_started_at = str(
-                    run["queue_wait_started_at"] or run["first_queued_at"]
-                )
-                deadline = str(run["queue_deadline_at"] or "")
-                transition_emitted = int(run["queue_transition_emitted"] or 0)
-                status_sequence = int(run["queue_status_sequence"] or 0)
-                callback_state = str(run["queue_callback_state"] or "unknown")
-                params["queue_next_status_at"] = run["queue_next_status_at"]
-            params.update(
-                {
-                    "queue_wait_generation": generation,
-                    "queue_wait_started_at": wait_started_at,
-                    "queue_deadline_at": deadline,
-                    "queue_transition_emitted": transition_emitted,
-                    "queue_status_sequence": status_sequence,
-                    "queue_callback_state": callback_state,
-                    "queue_terminal_callback_id": _queue_callback_id(
-                        "timeout",
-                        run_id=str(run_id),
-                        generation=generation,
-                        deadline=deadline,
-                    ),
-                }
-            )
-            params["source_runtime"] = (
-                params["source_runtime"] or str(worker["runtime"] or "")
-            )
-            params["source_model"] = (
-                params["source_model"] or str(worker["model"] or "")
-            )
-            conn.execute(
-                """
-                UPDATE workers
-                SET profile = :fallback_profile,
-                    backend = :fallback_backend,
-                    runtime = :fallback_runtime,
-                    model = :fallback_model,
-                    bootstrap_bundle_json = :bootstrap_bundle_json,
-                    session_key = NULL,
-                    state = 'ready',
-                    last_error = '',
-                    updated_at = :updated_at
-                WHERE worker_id = :worker_id
-                  AND profile = :expected_profile
-                """,
-                params,
-            )
-            if conn.total_changes == 0:
-                conn.execute("ROLLBACK")
-                return None
-            conn.execute(
-                f"""
-                UPDATE runs
-                SET state = 'queued',
-                    claimed_at = NULL,
-                    admitted_at = NULL,
-                    runtime_invoked_at = NULL,
-                    active_attempt_id = '',
-                    ended_at = NULL,
-                    retry_after = :retry_after,
-                    last_retry_class = :last_retry_class,
-                    error_text = :error_text,
-                    native_session_id = '',
-                    native_capabilities_json = '{{}}',
-                    native_child_summary_json = '{{}}',
-                    provider_route_profile = :fallback_profile,
-                    provider_route_runtime = :fallback_runtime,
-                    provider_route_model = :fallback_model,
-                    provider_route_decision = 'fallback_selected',
-                    provider_route_from_profile = :expected_profile,
-                    provider_route_from_runtime = :source_runtime,
-                    provider_route_from_model = :source_model,
-                    provider_route_failure_class = :route_failure_class,
-                    provider_route_cooldown_until = :route_cooldown_until,
-                    queue_wait_episode = :queue_wait_generation,
-                    queue_wait_open = 1,
-                    queue_wait_generation = :queue_wait_generation,
-                    queue_wait_started_at = :queue_wait_started_at,
-                    queue_wait_closed_at = NULL,
-                    queue_wait_duration_seconds = NULL,
-                    queue_deadline_at = :queue_deadline_at,
-                    queue_blocker_class = :route_failure_class,
-                    queue_next_status_at = :queue_next_status_at,
-                    queue_transition_emitted = :queue_transition_emitted,
-                    queue_status_sequence = :queue_status_sequence,
-                    queue_callback_state = :queue_callback_state,
-                    queue_terminal_callback_id = :queue_terminal_callback_id{failure_assignments}
-                WHERE run_id = :run_id
-                  AND worker_id = :worker_id
-                  AND state IN ('claimed', 'admitted', 'running')
-                """,
-                params,
-            )
-            attempt_id = str(run["active_attempt_id"] or "")
-            conn.execute(
-                """
-                UPDATE host_run_leases
-                SET status = 'released', released_at = ?,
-                    release_reason = ?, reconciled_at = COALESCE(reconciled_at, ?)
-                WHERE run_id = ? AND status = 'active'
-                """,
-                (
-                    observed_at,
-                    f"run_requeued:{params['route_failure_class']}",
-                    observed_at,
-                    str(run_id),
-                ),
-            )
-            if attempt_id:
-                conn.execute(
-                    """
-                    UPDATE run_attempts
-                    SET state = 'retry_queued', ended_at = ?,
-                        terminal_reason = ?
-                    WHERE attempt_id = ? AND ended_at IS NULL
-                    """,
-                    (
-                        params["attempt_ended_at"],
-                        params["last_retry_class"],
-                        attempt_id,
-                    ),
-                )
-                self._append_attempt_trace_conn(
-                    conn, attempt_id=attempt_id, created_at=observed_at
-                )
-            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-            if row is None or str(row["state"] or "") != "queued":
-                conn.execute("ROLLBACK")
-                return None
-            conn.execute("COMMIT")
-        return self._row(row)
-
-    @staticmethod
-    def _run_generation_is_exact_conn(
-        conn: sqlite3.Connection,
-        run: sqlite3.Row,
-        *,
-        expected_attempt_id: str,
-        expected_lease_id: str,
-        expected_executor_id: str,
-        expected_startup_token: str,
-        expected_runtime_invoked_at: str,
-    ) -> bool:
-        run_id = str(run["run_id"] or "")
-        attempt_id = str(run["active_attempt_id"] or "")
-        expected_generation = {
-            "attempt_id": str(expected_attempt_id or ""),
-            "lease_id": str(expected_lease_id or ""),
-            "executor_id": str(expected_executor_id or ""),
-            "startup_token": str(expected_startup_token or ""),
-            "runtime_invoked_at": str(expected_runtime_invoked_at or ""),
-        }
-        if not attempt_id:
-            return not any(expected_generation.values())
-        attempt = conn.execute(
-            "SELECT * FROM run_attempts WHERE run_id = ? AND attempt_id = ?",
-            (run_id, attempt_id),
-        ).fetchone()
-        lease = conn.execute(
-            """
-            SELECT * FROM host_run_leases
-            WHERE run_id = ? AND attempt_id = ? AND lease_id = ?
-            """,
-            (run_id, attempt_id, expected_generation["lease_id"]),
-        ).fetchone()
-        return bool(
-            expected_generation["attempt_id"] == attempt_id
-            and attempt is not None
-            and attempt["ended_at"] is None
-            and (
-                str(attempt["lease_id"] or "")
-                == expected_generation["lease_id"]
-                or (
-                    str(attempt["state"] or "") == "claimed"
-                    and not str(attempt["lease_id"] or "")
-                    and not expected_generation["runtime_invoked_at"]
-                )
-            )
-            and str(attempt["runtime_invoked_at"] or "")
-            == expected_generation["runtime_invoked_at"]
-            and str(run["runtime_invoked_at"] or "")
-            == expected_generation["runtime_invoked_at"]
-            and (
-                (
-                    lease is not None
-                    and str(lease["executor_id"] or "")
-                    == expected_generation["executor_id"]
-                    and str(lease["startup_token"] or "")
-                    == expected_generation["startup_token"]
-                )
-                or (
-                    lease is None
-                    and not str(attempt["lease_id"] or "")
-                    and not expected_generation["lease_id"]
-                    and not expected_generation["executor_id"]
-                    and not expected_generation["startup_token"]
-                    and not expected_generation["runtime_invoked_at"]
-                )
-            )
-        )
-
-    def settle_run_if_current(
-        self,
-        run_id: str,
-        *,
-        output_text: str,
-        native_child_summary_json: str,
-        expected_attempt_id: str = "",
-        expected_lease_id: str = "",
-        expected_executor_id: str = "",
-        expected_startup_token: str = "",
-        expected_runtime_invoked_at: str = "",
-    ) -> dict[str, Any] | None:
-        """Enter native settling only for one exact active attempt generation."""
-
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            run = conn.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
-            ).fetchone()
-            if (
-                run is None
-                or str(run["state"] or "") != "running"
-                or not self._run_generation_is_exact_conn(
-                    conn,
-                    run,
-                    expected_attempt_id=expected_attempt_id,
-                    expected_lease_id=expected_lease_id,
-                    expected_executor_id=expected_executor_id,
-                    expected_startup_token=expected_startup_token,
-                    expected_runtime_invoked_at=expected_runtime_invoked_at,
-                )
-            ):
-                conn.execute("COMMIT")
-                return None
-            worker = conn.execute(
-                "SELECT * FROM workers WHERE worker_id = ?", (run["worker_id"],)
-            ).fetchone()
-            if worker is not None and self._run_is_owned_by_destructive_claim(
-                worker, str(run_id)
-            ):
-                conn.execute("COMMIT")
-                return None
-            self._require_worker_work_admission(worker)
-            cursor = conn.execute(
-                """
-                UPDATE runs
-                SET state = 'settling', output_text = ?,
-                    native_child_summary_json = ?
-                WHERE run_id = ? AND state = 'running'
-                  AND active_attempt_id = ?
-                  AND COALESCE(runtime_invoked_at, '') = ?
-                """,
-                (
-                    str(output_text),
-                    str(native_child_summary_json),
-                    str(run_id),
-                    str(run["active_attempt_id"] or ""),
-                    str(run["runtime_invoked_at"] or ""),
-                ),
-            )
-            updated = conn.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
-            ).fetchone()
-            conn.execute("COMMIT")
-        return self._row(updated) if cursor.rowcount else None
-
-    def update_native_settling_summary_if_current(
-        self,
-        run_id: str,
-        *,
-        native_child_summary_json: str,
-        expected_attempt_id: str = "",
-        expected_lease_id: str = "",
-        expected_executor_id: str = "",
-        expected_startup_token: str = "",
-        expected_runtime_invoked_at: str = "",
-    ) -> dict[str, Any] | None:
-        """Update native projection only while the same attempt owns settling."""
-
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            run = conn.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
-            ).fetchone()
-            if (
-                run is None
-                or str(run["state"] or "") != "settling"
-                or not self._run_generation_is_exact_conn(
-                    conn,
-                    run,
-                    expected_attempt_id=expected_attempt_id,
-                    expected_lease_id=expected_lease_id,
-                    expected_executor_id=expected_executor_id,
-                    expected_startup_token=expected_startup_token,
-                    expected_runtime_invoked_at=expected_runtime_invoked_at,
-                )
-            ):
-                conn.execute("COMMIT")
-                return None
-            cursor = conn.execute(
-                """
-                UPDATE runs SET native_child_summary_json = ?
-                WHERE run_id = ? AND state = 'settling'
-                  AND active_attempt_id = ?
-                  AND COALESCE(runtime_invoked_at, '') = ?
-                """,
-                (
-                    str(native_child_summary_json),
-                    str(run_id),
-                    str(run["active_attempt_id"] or ""),
-                    str(run["runtime_invoked_at"] or ""),
-                ),
-            )
-            updated = conn.execute(
-                "SELECT * FROM runs WHERE run_id = ?", (str(run_id),)
-            ).fetchone()
-            conn.execute("COMMIT")
-        return self._row(updated) if cursor.rowcount else None
 
     def rebind_schedule_run(
         self,
@@ -22527,316 +26206,7 @@ class Store:
             ).fetchone()
         return self._row(row)
 
-    def add_event_once(
-        self,
-        *,
-        event_id: str,
-        project_id: str,
-        worker_id: str,
-        run_id: str | None,
-        event_type: str,
-        message: str,
-        tenant_id: str | None = None,
-        payload: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        if not str(event_id or "").strip():
-            raise ValueError("Event insertion requires a deterministic identity")
-        if not tenant_id:
-            worker = self.get_worker(worker_id) or {}
-            project = self.get_project(project_id) or {}
-            tenant_id = str(
-                worker.get("tenant_id") or project.get("tenant_id") or "local"
-            )
-        data = {
-            "event_id": str(event_id),
-            "project_id": str(project_id),
-            "worker_id": str(worker_id),
-            "tenant_id": str(tenant_id),
-            "run_id": run_id,
-            "event_type": str(event_type),
-            "message": str(message),
-            "payload_json": json.dumps(
-                payload or {}, ensure_ascii=False, sort_keys=True
-            ),
-            "created_at": utc_now(),
-        }
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO events (
-                    event_id, project_id, worker_id, tenant_id, run_id,
-                    event_type, message, payload_json, created_at
-                ) VALUES (
-                    :event_id, :project_id, :worker_id, :tenant_id, :run_id,
-                    :event_type, :message, :payload_json, :created_at
-                )
-                """,
-                data,
-            )
-            row = conn.execute(
-                "SELECT * FROM events WHERE event_id = ?", (str(event_id),)
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("Durable event insertion failed")
-        return dict(row)
 
-    def record_worker_isolation_audits(
-        self, observations: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Atomically bind immutable isolation audits to exact active owner leases."""
-
-        if not isinstance(observations, list) or not observations or len(observations) > 32:
-            raise ValueError("Worker isolation audit requires exact observations")
-        if len(
-            {
-                (
-                    str(item.get("tenant_id") or ""),
-                    str(item.get("owner_id") or ""),
-                )
-                for item in observations
-                if isinstance(item, dict)
-            }
-        ) != 1:
-            raise ValueError("Worker isolation audit cannot cross owner scopes")
-
-        def fingerprint(kind: str, value: object) -> str:
-            return "sha256:" + hashlib.sha256(
-                f"{kind}\0{str(value or '').strip()}".encode("utf-8")
-            ).hexdigest()
-
-        all_work_hashes = {
-            fingerprint("work", observation.get("work_ref"))
-            for observation in observations
-            if isinstance(observation, dict)
-        }
-        if len(all_work_hashes) != len(observations):
-            raise ValueError("Worker isolation audit duplicates mission scope")
-        required_fields = {
-            "contractVersion",
-            "producerScope",
-            "ownerRefHash",
-            "workRefHash",
-            "runRefHash",
-            "workerRefHash",
-            "attemptRefHash",
-            "leaseRefHash",
-            "containerRefHash",
-            "workspaceRefHash",
-            "homeRefHash",
-            "networkRefHash",
-            "pidNamespaceRefHash",
-            "executionMode",
-            "hostStateReadable",
-            "serviceEnvironmentReadable",
-            "dockerSocketReadable",
-            "ambientAuthority",
-            "peerAccessDenied",
-            "hostAccessDenied",
-            "peerProbes",
-        }
-        now = utc_now()
-        inserted: list[dict[str, Any]] = []
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            for observation in observations:
-                if not isinstance(observation, dict):
-                    raise ValueError("Worker isolation audit scope is invalid")
-                payload = observation.get("payload")
-                event_id = str(observation.get("event_id") or "")
-                trace_event_id = str(observation.get("trace_event_id") or "")
-                if (
-                    not isinstance(payload, dict)
-                    or not event_id.startswith("evt_isolation_")
-                    or trace_event_id != "trace_" + event_id.removeprefix("evt_")
-                ):
-                    raise ValueError("Worker isolation audit identity is invalid")
-                scope = conn.execute(
-                    """
-                    SELECT d.project_id, d.worker_id, d.current_run_id,
-                           d.tenant_id, d.owner_id, r.active_attempt_id,
-                           l.lease_id, l.startup_container_id,
-                           COALESCE(NULLIF(w.workspace_root, ''), w.workspace_dir)
-                               AS workspace_root
-                    FROM delegations d
-                    JOIN workers w
-                      ON w.worker_id = d.worker_id
-                     AND w.project_id = d.project_id
-                     AND w.tenant_id = d.tenant_id
-                     AND w.owner_id = d.owner_id
-                    JOIN runs r
-                      ON r.run_id = d.current_run_id
-                     AND r.worker_id = d.worker_id
-                     AND r.project_id = d.project_id
-                     AND r.tenant_id = d.tenant_id
-                    JOIN run_attempts a
-                      ON a.attempt_id = r.active_attempt_id
-                     AND a.run_id = r.run_id
-                    JOIN host_run_leases l
-                      ON l.lease_id = a.lease_id
-                     AND l.attempt_id = a.attempt_id
-                     AND l.run_id = r.run_id
-                     AND l.worker_id = d.worker_id
-                     AND l.tenant_id = d.tenant_id
-                     AND l.owner_id = d.owner_id
-                    WHERE d.work_ref = ? AND d.tenant_id = ? AND d.owner_id = ?
-                      AND d.worker_id = ? AND d.project_id = ?
-                      AND d.current_run_id = ? AND r.state = 'running'
-                      AND r.runtime_invoked_at IS NOT NULL AND r.ended_at IS NULL
-                      AND r.active_attempt_id = ? AND a.state = 'running'
-                      AND a.runtime_invoked_at = r.runtime_invoked_at
-                      AND a.ended_at IS NULL AND l.lease_id = ?
-                      AND l.status = 'active' AND l.expires_at > ?
-                      AND l.startup_state = 'confirmed'
-                      AND l.startup_identity_kind = 'docker_session'
-                      AND l.startup_container_id = ?
-                    """,
-                    (
-                        str(observation.get("work_ref") or ""),
-                        str(observation.get("tenant_id") or ""),
-                        str(observation.get("owner_id") or ""),
-                        str(observation.get("worker_id") or ""),
-                        str(observation.get("project_id") or ""),
-                        str(observation.get("run_id") or ""),
-                        str(observation.get("attempt_id") or ""),
-                        str(observation.get("lease_id") or ""),
-                        now,
-                        str(observation.get("container_id") or ""),
-                    ),
-                ).fetchone()
-                if scope is None:
-                    raise RuntimeError("Worker isolation audit lost its exact owner generation")
-                expected_hashes = {
-                    "ownerRefHash": fingerprint("owner", scope["owner_id"]),
-                    "workRefHash": fingerprint("work", observation["work_ref"]),
-                    "runRefHash": fingerprint("run", scope["current_run_id"]),
-                    "workerRefHash": fingerprint("worker", scope["worker_id"]),
-                    "attemptRefHash": fingerprint("attempt", scope["active_attempt_id"]),
-                    "leaseRefHash": fingerprint("lease", scope["lease_id"]),
-                    "containerRefHash": fingerprint(
-                        "container", scope["startup_container_id"]
-                    ),
-                    "workspaceRefHash": fingerprint(
-                        "workspace", Path(str(scope["workspace_root"] or "")).resolve()
-                    ),
-                    "pidNamespaceRefHash": fingerprint(
-                        "pid_namespace", scope["startup_container_id"]
-                    ),
-                }
-                peers = payload.get("peerProbes")
-                if (
-                    set(payload) != required_fields
-                    or payload.get("contractVersion") != 1
-                    or payload.get("producerScope") != "glasshive.worker_isolation"
-                    or any(payload.get(field) != value for field, value in expected_hashes.items())
-                    or any(
-                        re.fullmatch(r"sha256:[a-f0-9]{64}", str(payload.get(field) or ""))
-                        is None
-                        for field in ("homeRefHash", "networkRefHash")
-                    )
-                    or payload.get("executionMode") != "isolated_container"
-                    or any(
-                        payload.get(field) is not False
-                        for field in (
-                            "hostStateReadable",
-                            "serviceEnvironmentReadable",
-                            "dockerSocketReadable",
-                            "ambientAuthority",
-                        )
-                    )
-                    or payload.get("hostAccessDenied") is not True
-                    or not isinstance(peers, list)
-                    or payload.get("peerAccessDenied") is not bool(peers)
-                    or any(
-                        not isinstance(peer, dict)
-                        or set(peer) != {"workRefHash", "reachable"}
-                        or peer.get("reachable") is not False
-                        for peer in peers
-                    )
-                ):
-                    raise ValueError("Worker isolation audit proof is not owner-bound")
-                peer_hashes = [str(peer["workRefHash"]) for peer in peers]
-                expected_peers = sorted(all_work_hashes - {expected_hashes["workRefHash"]})
-                if peer_hashes != expected_peers:
-                    raise ValueError("Worker isolation audit peer evidence is invalid")
-                correlation = {
-                    "ownerRefHash": payload["ownerRefHash"],
-                    "workRefHash": payload["workRefHash"],
-                    "runRefHash": payload["runRefHash"],
-                    "attemptRefHash": payload["attemptRefHash"],
-                    "leaseRefHash": payload["leaseRefHash"],
-                    "containerRefHash": payload["containerRefHash"],
-                    "peers": peer_hashes,
-                }
-                digest = hashlib.sha256(
-                    json.dumps(
-                        correlation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                    ).encode("utf-8")
-                ).hexdigest()
-                if event_id != f"evt_isolation_{digest}" or trace_event_id != f"trace_isolation_{digest}":
-                    raise ValueError("Worker isolation audit identity is not exact")
-                data = {
-                    "event_id": event_id,
-                    "project_id": str(scope["project_id"]),
-                    "worker_id": str(scope["worker_id"]),
-                    "tenant_id": str(scope["tenant_id"]),
-                    "run_id": str(scope["current_run_id"]),
-                    "event_type": "worker.isolation_probe",
-                    "message": "Confirmed isolated worker and mission network.",
-                    "payload_json": json.dumps(
-                        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                    ),
-                    "created_at": now,
-                }
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO events (
-                        event_id, project_id, worker_id, tenant_id, run_id,
-                        event_type, message, payload_json, created_at
-                    ) VALUES (
-                        :event_id, :project_id, :worker_id, :tenant_id, :run_id,
-                        :event_type, :message, :payload_json, :created_at
-                    )
-                    """,
-                    data,
-                )
-                event = conn.execute(
-                    "SELECT * FROM events WHERE event_id = ?", (event_id,)
-                ).fetchone()
-                if event is None or any(
-                    str(event[field] or "") != str(data[field] or "")
-                    for field in (
-                        "project_id",
-                        "worker_id",
-                        "tenant_id",
-                        "run_id",
-                        "event_type",
-                        "payload_json",
-                    )
-                ):
-                    raise RuntimeError("Worker isolation audit identity collides")
-                trace = self._append_work_trace_event_conn(
-                    conn,
-                    trace_event_id=trace_event_id,
-                    run_id=str(scope["current_run_id"]),
-                    work_ref=str(observation["work_ref"]),
-                    tenant_id=str(scope["tenant_id"]),
-                    owner_id=str(scope["owner_id"]),
-                    event_type="worker.isolation_probe",
-                    payload=payload,
-                    created_at=str(event["created_at"]),
-                )
-                if (
-                    str(trace["run_id"] or "") != str(scope["current_run_id"])
-                    or str(trace["work_ref"] or "") != str(observation["work_ref"])
-                    or str(trace["tenant_id"] or "") != str(scope["tenant_id"])
-                    or str(trace["owner_id"] or "") != str(scope["owner_id"])
-                    or str(trace["event_type"] or "") != "worker.isolation_probe"
-                    or json.loads(str(trace["payload_json"] or "{}")) != payload
-                ):
-                    raise RuntimeError("Worker isolation audit trace identity collides")
-                inserted.append(dict(event))
-            conn.execute("COMMIT")
-        return inserted
 
     def insert_terminal_callback_outbox_if_current(
         self,
@@ -22931,473 +26301,15 @@ class Store:
             conn.execute("COMMIT")
         return {**dict(row), "_inserted": existing is None}
 
-    def insert_callback_outbox_once(
-        self,
-        *,
-        callback_id: str,
-        project_id: str,
-        worker_id: str,
-        run_id: str | None,
-        attempt_number: int | None = None,
-        event_type: str,
-        url: str,
-        payload_json: str,
-    ) -> dict[str, Any]:
-        """Insert one immutable callback intent without rewinding delivery state."""
 
-        clean_callback_id = str(callback_id or "").strip()
-        if not clean_callback_id:
-            raise ValueError("Callback insertion requires a deterministic identity")
-        now = utc_now()
-        worker = self.get_worker(worker_id) or {}
-        project = self.get_project(project_id) or {}
-        tenant_id = str(
-            worker.get("tenant_id") or project.get("tenant_id") or "local"
-        )
-        intent = {
-            "callback_id": clean_callback_id,
-            "project_id": str(project_id or ""),
-            "worker_id": str(worker_id or ""),
-            "tenant_id": tenant_id,
-            "run_id": run_id,
-            "attempt_number": attempt_number,
-            "event_type": str(event_type or ""),
-            "url": str(url or ""),
-            "payload_json": str(payload_json or "{}"),
-        }
-        with self._connect() as conn:
-            before = conn.total_changes
-            row = self._insert_callback_intent_conn(conn, intent, now=now)
-            inserted = conn.total_changes > before
-        if row is None:
-            raise RuntimeError("Callback outbox insertion did not persist")
-        return {**dict(row), "_inserted": inserted}
 
-    def get_callback_outbox(self, callback_id: str) -> dict[str, Any] | None:
-        """Read one durable callback intent without changing delivery state."""
 
-        clean_callback_id = str(callback_id or "").strip()
-        if not clean_callback_id:
-            return None
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM callback_outbox WHERE callback_id = ?",
-                (clean_callback_id,),
-            ).fetchone()
-        return dict(row) if row is not None else None
 
-    def accept_terminal_callback_result(
-        self,
-        *,
-        receiver_scope: str,
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Apply the receiver-side monotonic CAS for one terminal result."""
 
-        clean_scope = str(receiver_scope or "").strip()
-        if not clean_scope or len(clean_scope) > 256:
-            raise ValueError("Terminal callback receiver scope is invalid")
-        if not isinstance(payload, dict):
-            raise ValueError("Terminal callback receiver payload must be structured")
-        callback_id = str(payload.get("callback_id") or "").strip()
-        run_id = str(payload.get("run_id") or "").strip()
-        event_type = str(payload.get("event") or "").strip()
-        result_state = str(payload.get("result_state") or "").strip()
-        result_ended_at = str(payload.get("result_ended_at") or "").strip()
-        result_revision = payload.get("result_revision")
-        result_digest = str(payload.get("result_digest") or "").strip()
-        attempt_value = payload.get("attempt_number")
-        if attempt_value is None:
-            attempt_number = 0
-        elif (
-            isinstance(attempt_value, int)
-            and not isinstance(attempt_value, bool)
-            and attempt_value > 0
-        ):
-            attempt_number = attempt_value
-        else:
-            raise ValueError("Terminal callback attempt identity is invalid")
-        callback_terminal_state = {
-            "run.completed": "completed",
-            "run.failed": "failed",
-            "run.cancelled": "cancelled",
-            "run.interrupted": "cancelled",
-        }.get(event_type)
-        if (
-            re.fullmatch(r"cb_terminal_[0-9a-f]{64}", callback_id) is None
-            or not run_id
-            or result_state not in {"completed", "failed", "cancelled"}
-            or callback_terminal_state != result_state
-            or not result_ended_at
-            or not isinstance(result_revision, int)
-            or isinstance(result_revision, bool)
-            or result_revision < 1
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", result_digest) is None
-            or callback_id
-            != _terminal_callback_id(
-                run_id=run_id,
-                state=result_state,
-                ended_at=result_ended_at,
-                attempt_number=attempt_number,
-                result_revision=result_revision,
-                result_digest=result_digest,
-            )
-        ):
-            raise ValueError("Terminal callback result identity is invalid")
-        payload_json = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        now = utc_now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            current = conn.execute(
-                """
-                SELECT * FROM terminal_callback_results
-                WHERE receiver_scope = ? AND run_id = ?
-                """,
-                (clean_scope, run_id),
-            ).fetchone()
-            if current is None or result_revision > int(
-                current["result_revision"] or 0
-            ):
-                status = "accepted"
-                conn.execute(
-                    """
-                    INSERT INTO terminal_callback_results (
-                        receiver_scope, run_id, callback_id, result_revision,
-                        result_digest, payload_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(receiver_scope, run_id) DO UPDATE SET
-                        callback_id = excluded.callback_id,
-                        result_revision = excluded.result_revision,
-                        result_digest = excluded.result_digest,
-                        payload_json = excluded.payload_json,
-                        updated_at = excluded.updated_at
-                    WHERE excluded.result_revision
-                        > terminal_callback_results.result_revision
-                    """,
-                    (
-                        clean_scope,
-                        run_id,
-                        callback_id,
-                        result_revision,
-                        result_digest,
-                        payload_json,
-                        now,
-                    ),
-                )
-                current = conn.execute(
-                    """
-                    SELECT * FROM terminal_callback_results
-                    WHERE receiver_scope = ? AND run_id = ?
-                    """,
-                    (clean_scope, run_id),
-                ).fetchone()
-            elif result_revision < int(current["result_revision"] or 0):
-                status = "superseded"
-            elif (
-                callback_id == str(current["callback_id"] or "")
-                and result_digest == str(current["result_digest"] or "")
-            ):
-                status = "idempotent"
-            else:
-                status = "conflict"
-            if current is None:
-                conn.execute("ROLLBACK")
-                raise RuntimeError("Terminal callback receiver CAS did not persist")
-            current_revision = int(current["result_revision"] or 0)
-            current_digest = str(current["result_digest"] or "")
-            current_callback_id = str(current["callback_id"] or "")
-            conn.execute(
-                """
-                INSERT INTO terminal_callback_result_attempts (
-                    receiver_scope, run_id, callback_id, result_revision,
-                    result_digest, status, current_result_revision,
-                    current_result_digest, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    clean_scope,
-                    run_id,
-                    callback_id,
-                    result_revision,
-                    result_digest,
-                    status,
-                    current_revision,
-                    current_digest,
-                    now,
-                ),
-            )
-            conn.execute("COMMIT")
-        return {
-            "http_status": 200 if status in {"accepted", "idempotent"} else 409,
-            "callback_status": status,
-            "callback_id": callback_id,
-            "run_id": run_id,
-            "result_revision": result_revision,
-            "result_digest": result_digest,
-            "current_callback_id": current_callback_id,
-            "current_result_revision": current_revision,
-            "current_result_digest": current_digest,
-        }
 
-    def get_terminal_callback_result(
-        self,
-        *,
-        receiver_scope: str,
-        run_id: str,
-    ) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM terminal_callback_results
-                WHERE receiver_scope = ? AND run_id = ?
-                """,
-                (str(receiver_scope), str(run_id)),
-            ).fetchone()
-        return self._row(row)
 
-    def list_terminal_callback_result_attempts(
-        self,
-        *,
-        receiver_scope: str,
-        run_id: str,
-    ) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM terminal_callback_result_attempts
-                WHERE receiver_scope = ? AND run_id = ?
-                ORDER BY attempt_id ASC
-                """,
-                (str(receiver_scope), str(run_id)),
-            ).fetchall()
-        return self._rows(rows)
 
-    @staticmethod
-    def _terminal_callback_is_current_conn(
-        conn: sqlite3.Connection,
-        callback: sqlite3.Row,
-    ) -> bool:
-        """Bind a canonical terminal callback to the current durable result."""
 
-        callback_id = str(callback["callback_id"] or "")
-        result_revision = int(callback["result_revision"] or 0)
-        result_digest = str(callback["result_digest"] or "")
-        if not callback_id.startswith("cb_terminal_"):
-            return result_revision == 0 and not result_digest
-        if result_revision < 1 or not result_digest.startswith("sha256:"):
-            return False
-        run_id = str(callback["run_id"] or "")
-        run = conn.execute(
-            "SELECT * FROM runs WHERE run_id = ?",
-            (run_id,),
-        ).fetchone()
-        if run is None:
-            return False
-        state = str(run["state"] or "")
-        event_type = str(callback["event_type"] or "")
-        result_state = _terminal_callback_wire_state(state, event_type)
-        ended_at = str(run["ended_at"] or "")
-        attempt_number = Store._callback_attempt_number_conn(conn, run_id)
-        current_result_revision = int(run["terminal_result_revision"] or 0)
-        current_result_digest = _terminal_result_digest(run)
-        return bool(
-            state in TERMINAL_RUN_STATES
-            and bool(result_state)
-            and ended_at
-            and event_type == f"run.{state}"
-            and int(callback["attempt_number"] or 0) == attempt_number
-            and result_revision == current_result_revision
-            and result_digest == current_result_digest
-            and callback_id
-            == _terminal_callback_id(
-                run_id=run_id,
-                state=result_state,
-                ended_at=ended_at,
-                attempt_number=attempt_number,
-                result_revision=current_result_revision,
-                result_digest=current_result_digest,
-            )
-        )
-
-    def _supersede_terminal_callback_conn(
-        self,
-        conn: sqlite3.Connection,
-        callback: sqlite3.Row,
-        *,
-        now: str,
-        reason: str = "terminal_result_superseded",
-        attempts: int = 0,
-    ) -> sqlite3.Row:
-        callback_id = str(callback["callback_id"] or "")
-        conn.execute(
-            """
-            UPDATE callback_outbox
-            SET status = 'superseded',
-                attempts = attempts + ?,
-                last_error = ?,
-                updated_at = ?, delivered_at = NULL,
-                http_accepted_at = NULL,
-                delivery_lease_token = '',
-                delivery_lease_expires_at = NULL
-            WHERE callback_id = ?
-              AND status IN ('pending', 'delivering')
-            """,
-            (max(0, int(attempts)), str(reason)[:2000], now, callback_id),
-        )
-        row = conn.execute(
-            "SELECT * FROM callback_outbox WHERE callback_id = ?",
-            (callback_id,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("Superseded callback disappeared")
-        self._append_callback_trace_conn(conn, callback_id=callback_id)
-        return row
-
-    def callback_delivery_is_current(
-        self,
-        callback_id: str,
-        *,
-        lease_token: str,
-        delivery_generation: int,
-    ) -> bool:
-        """Recheck exact terminal result ownership immediately before HTTP."""
-
-        now = utc_now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            callback = conn.execute(
-                """
-                SELECT * FROM callback_outbox
-                WHERE callback_id = ? AND status = 'delivering'
-                  AND delivery_lease_token = ? AND delivery_generation = ?
-                """,
-                (
-                    str(callback_id),
-                    str(lease_token),
-                    int(delivery_generation),
-                ),
-            ).fetchone()
-            if callback is None:
-                conn.execute("COMMIT")
-                return False
-            if not self._terminal_callback_is_current_conn(conn, callback):
-                self._supersede_terminal_callback_conn(conn, callback, now=now)
-                conn.execute("COMMIT")
-                return False
-            conn.execute("COMMIT")
-        return True
-
-    def expire_callback_delivery_lease_for_local_qa(
-        self,
-        callback_id: str,
-        *,
-        lease_token: str,
-        delivery_generation: int,
-    ) -> bool:
-        """Expire only one exact sender lease so normal reclaim can rotate it."""
-
-        expired_at = (
-            datetime.now(timezone.utc) - timedelta(seconds=1)
-        ).isoformat()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            updated = conn.execute(
-                """
-                UPDATE callback_outbox
-                SET delivery_lease_expires_at = ?, updated_at = ?
-                WHERE callback_id = ? AND status = 'delivering'
-                  AND delivery_lease_token = ? AND delivery_generation = ?
-                """,
-                (
-                    expired_at,
-                    expired_at,
-                    str(callback_id),
-                    str(lease_token),
-                    int(delivery_generation),
-                ),
-            ).rowcount
-            if updated == 1:
-                self._append_callback_trace_conn(
-                    conn, callback_id=str(callback_id)
-                )
-            conn.execute("COMMIT")
-        return updated == 1
-
-    def mark_callback_http_accepted(
-        self,
-        callback_id: str,
-        *,
-        lease_token: str,
-        delivery_generation: int,
-        attempts: int,
-        payload_json: str,
-    ) -> dict[str, Any] | None:
-        accepted_at = utc_now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            current = conn.execute(
-                """
-                SELECT * FROM callback_outbox
-                WHERE callback_id = ? AND status = 'delivering'
-                  AND delivery_lease_token = ? AND delivery_generation = ?
-                """,
-                (
-                    str(callback_id),
-                    str(lease_token),
-                    int(delivery_generation),
-                ),
-            ).fetchone()
-            if current is None:
-                conn.execute("COMMIT")
-                return None
-            if not self._terminal_callback_is_current_conn(conn, current):
-                row = self._supersede_terminal_callback_conn(
-                    conn,
-                    current,
-                    now=accepted_at,
-                    attempts=attempts,
-                )
-                conn.execute("COMMIT")
-                return self._row(row)
-            accepted_at = self._strictly_after(
-                accepted_at, str(current["created_at"] or "")
-            )
-            cur = conn.execute(
-                """
-                UPDATE callback_outbox
-                SET status = 'http_accepted',
-                    attempts = attempts + ?,
-                    payload_json = ?,
-                    last_error = '',
-                    updated_at = ?,
-                    delivered_at = NULL,
-                    http_accepted_at = ?,
-                    delivery_lease_token = '', delivery_lease_expires_at = NULL
-                WHERE callback_id = ? AND status = 'delivering'
-                  AND delivery_lease_token = ? AND delivery_generation = ?
-                """,
-                (
-                    attempts,
-                    payload_json,
-                    accepted_at,
-                    accepted_at,
-                    callback_id,
-                    str(lease_token),
-                    int(delivery_generation),
-                ),
-            )
-            if cur.rowcount != 1:
-                conn.execute("COMMIT")
-                return None
-            row = conn.execute("SELECT * FROM callback_outbox WHERE callback_id = ?", (callback_id,)).fetchone()
-            self._append_callback_trace_conn(conn, callback_id=str(callback_id))
-            conn.execute("COMMIT")
-        return self._row(row)
 
     def mark_callback_receiver_superseded(
         self,

@@ -14,6 +14,17 @@ WorkerState = Literal[
     "starting",
     "ready",
     "running",
+    "stopping",
+    "paused",
+    "needs_input",
+    "failed",
+    "terminated",
+]
+PublicWorkerState = Literal[
+    "created",
+    "starting",
+    "ready",
+    "running",
     "paused",
     "failed",
     "terminated",
@@ -157,6 +168,7 @@ class CreateWorkerRequest(BaseModel):
         default="",
         description="Execution mode, host or docker. Empty means use the deployment default.",
     )
+    resource_class: WorkerResourceClass = "standard"
     alias: str | None = None
     workspace_root: str | None = None
     bootstrap_profile: str | None = None
@@ -186,10 +198,12 @@ class WorkerResponse(BaseModel):
     profile: str
     backend: str
     execution_mode: ExecutionMode = "docker"
+    resource_class: WorkerResourceClass = "standard"
+    resource_memory_bytes: int | None = None
     alias: str | None = None
     runtime: str = ""
     model: str = ""
-    state: WorkerState
+    state: PublicWorkerState
     close_state: WorkerCloseState | None = None
     bootstrap_profile: str | None = None
     gateway_url: str | None = None
@@ -269,14 +283,14 @@ class WorkspaceContinuationContextRequest(BaseModel):
         return self
 
 class AssignRunRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     instruction: str = Field(min_length=1)
     effort: str | None = None
     bootstrap_bundle: dict[str, object] | None = None
-
     continuation_context: WorkspaceContinuationContextRequest | None = Field(
         default=None, alias="continuationContext"
     )
-
 
 class SendMessageRequest(BaseModel):
     message: str = Field(min_length=1)
@@ -595,7 +609,27 @@ class RunResponse(BaseModel):
     instruction: str
     state: RunState
     queued_at: str
+    first_queued_at: str
+    queue_deadline_at: str
+    queue_blocker_class: str = "admission_pending"
+    queue_next_status_at: str | None = None
+    queue_wait_episode: int = 1
+    queue_wait_open: bool = True
+    queue_wait_generation: int = 1
+    queue_wait_started_at: str
+    queue_wait_closed_at: str | None = None
+    queue_wait_duration_seconds: int | None = None
+    queue_transition_emitted: bool = False
+    queue_status_sequence: int = 0
+    queue_callback_state: Literal[
+        "unknown", "pending", "enqueued", "unavailable"
+    ] = "unknown"
+    queue_terminal_callback_id: str = ""
+    claimed_at: str | None = None
+    admitted_at: str | None = None
     started_at: str | None = None
+    runtime_invoked_at: str | None = None
+    active_attempt_id: str = ""
     ended_at: str | None = None
     output_text: str = ""
     error_text: str = ""
@@ -832,6 +866,7 @@ class EventResponse(BaseModel):
     run_id: str | None = None
     event_type: str
     message: str
+    payload_json: str = "{}"
     created_at: str
 
 

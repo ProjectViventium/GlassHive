@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import time
 import uuid
 import zipfile
@@ -35,7 +36,9 @@ from workers_projects_runtime.deliverables import (
     is_user_deliverable_relative_path,
 )
 from workers_projects_runtime.openclaw_runtime import (
+    HostCapacityError,
     RuntimeErrorBase,
+    ProviderRateLimitError,
     RuntimeInfo,
     OpenClawRuntime,
     StubRuntime,
@@ -45,9 +48,11 @@ from workers_projects_runtime.openclaw_runtime import (
     notify_runtime_started,
     runtime_start_boundary,
 )
+from workers_projects_runtime.profile_runtime import HostCodexCliRuntime, ProfiledWorkerRuntime
 from workers_projects_runtime.service import (
     GlassHiveQuotaExceededError,
     WorkersProjectsService,
+    merge_bootstrap_bundle,
     public_callback_message_text,
     terminal_callback_full_message,
     terminal_callback_message,
@@ -70,6 +75,15 @@ from workers_projects_runtime.store import (
     WorkerClosedStoreError,
 )
 from workers_projects_runtime.terminal_takeover import TerminalTarget
+
+
+def exact_terminal_generation(store: Store, run_id: str) -> dict[str, str]:
+    run = store.get_run(run_id)
+    assert run is not None
+    return {
+        **(store.get_run_retry_generation(run_id) or {}),
+        "expected_runtime_invoked_at": str(run.get("runtime_invoked_at") or ""),
+    }
 
 
 def test_provider_readiness_endpoint_returns_only_bounded_profile_status(
@@ -168,9 +182,9 @@ def test_signed_link_helpers_close_sqlite_connections_deterministically(
     assert not signed_links_module.is_worker_signed_link_revoked(
         "wrk_connection_lifetime"
     )
-    assert resolve_signed_link_ref(ref_id) is not None
+    assert resolve_signed_link_ref(ref_id) is None
 
-    assert len(opened) == 4
+    assert len(opened) >= 4
     for connection in opened:
         with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
             connection.execute("SELECT 1")
@@ -923,6 +937,7 @@ def test_store_migrates_compute_released_marker_for_existing_db(tmp_path):
         runtime="codex-cli",
         model="stub/codex-cli",
     )
+    worker = migrated.get_worker(worker["worker_id"]) or worker
 
     assert worker["compute_released_at"] is None
 
@@ -1002,6 +1017,95 @@ def test_user_preferences_are_scoped_and_validate_profile_allowlist(tmp_path, mo
     rejected = client.patch("/v1/preferences", headers=user_a, json={"default_worker_profile": "claude-code"})
     assert rejected.status_code == 400
     assert "not allowed" in rejected.text
+
+
+def test_local_service_identity_cannot_cross_owner_project_worker_or_run_scope(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "service-token")
+    app = create_app(
+        db_path=str(tmp_path / "local-owner-scope.db"),
+        runtime_backend="stub",
+        reconcile_on_startup=False,
+    )
+    app.state.service._ensure_worker_processor = lambda _worker_id: None
+    client = TestClient(app)
+    owner_a = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-local",
+        "X-Viventium-User-Id": "owner-a",
+    }
+    owner_b = {
+        "Authorization": "Bearer service-token",
+        "X-Viventium-Tenant-Id": "tenant-local",
+        "X-Viventium-User-Id": "owner-b",
+    }
+
+    created_project = client.post(
+        "/v1/projects",
+        headers=owner_a,
+        json={"owner_id": "forged-owner", "title": "Owner A", "goal": "Scoped work"},
+    )
+    assert created_project.status_code == 201
+    project = created_project.json()
+    assert project["owner_id"] == "owner-a"
+    created_worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=owner_a,
+        json={
+            "owner_id": "owner-b",
+            "name": "Owner A worker",
+            "role": "Scoped worker",
+            "profile": "codex-cli",
+            "start_synchronously": False,
+        },
+    )
+    assert created_worker.status_code == 201
+    worker = created_worker.json()
+    assert worker["owner_id"] == "owner-a"
+    assigned = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=owner_a,
+        json={"instruction": "Do owner A work."},
+    )
+    assert assigned.status_code == 202
+    run = assigned.json()
+
+    assert [item["project_id"] for item in client.get("/v1/projects", headers=owner_b).json()["items"]] == []
+    for path in (
+        f"/v1/projects/{project['project_id']}",
+        f"/v1/projects/{project['project_id']}/workers",
+        f"/v1/workers/{worker['worker_id']}",
+        f"/v1/runs/{run['run_id']}",
+    ):
+        assert client.get(path, headers=owner_b).status_code == 404
+    assert client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=owner_b,
+        json={
+            "owner_id": "owner-b",
+            "name": "Intruder",
+            "role": "Must not attach",
+            "profile": "codex-cli",
+            "start_synchronously": False,
+        },
+    ).status_code == 404
+    assert client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=owner_b,
+        json={"instruction": "Cross-owner assignment"},
+    ).status_code == 404
+    assert client.post(
+        f"/v1/workers/{worker['worker_id']}/pause", headers=owner_b
+    ).status_code == 404
+    with pytest.raises(WebSocketDisconnect) as cross_owner_terminal:
+        with client.websocket_connect(
+            f"/ws/workers/{worker['worker_id']}/terminal",
+            headers=owner_b,
+        ):
+            pass
+    assert cross_owner_terminal.value.code == 4404
 
 
 def test_terminal_callback_message_uses_line_anchored_final_report_marker():
@@ -2227,9 +2331,15 @@ def test_retryable_capacity_wait_does_not_consume_generic_retry_budget(
     tmp_path, monkeypatch
 ):
     class AlwaysBusyRuntime(StubRuntime):
+        capacity_checks = 0
+
         def worker_capacity_error(self, worker: dict) -> RuntimeErrorBase | None:
             _ = worker
-            return RuntimeErrorBase("Host-native codex-cli already has an active worker (wrk_busy123456).")
+            self.capacity_checks += 1
+            return HostCapacityError(
+                "Host mission lane is full.",
+                capacity_class="family_lane",
+            )
 
         def run_task(
             self,
@@ -2261,7 +2371,8 @@ def test_retryable_capacity_wait_does_not_consume_generic_retry_budget(
     monkeypatch.setattr("workers_projects_runtime.service.httpx.post", capture_post)
 
     store = Store(str(tmp_path / "runtime.db"))
-    service = WorkersProjectsService(store, AlwaysBusyRuntime(), max_workers=2)
+    runtime = AlwaysBusyRuntime()
+    service = WorkersProjectsService(store, runtime, max_workers=2)
     try:
         project = store.create_project("owner", "Capacity Cap", "Bound retry loops.", "codex-cli")
         worker = store.create_worker(
@@ -2273,6 +2384,7 @@ def test_retryable_capacity_wait_does_not_consume_generic_retry_budget(
             backend="openclaw",
             runtime="codex-cli",
             model="stub/codex-cli",
+            execution_mode="host",
             bootstrap_bundle={
                 "callbacks": {
                     "events_webhook_url": "http://callback.local/glasshive",
@@ -2290,7 +2402,7 @@ def test_retryable_capacity_wait_does_not_consume_generic_retry_budget(
             lambda: (
                 (store.get_run(run["run_id"]) or {}).get("state") == "queued"
                 and (store.get_run(run["run_id"]) or {}).get("failure_class")
-                == "host_worker_busy"
+                == "host_capacity"
                 and bool((store.get_run(run["run_id"]) or {}).get("retry_after"))
             ),
             timeout=3.0,
@@ -2298,7 +2410,7 @@ def test_retryable_capacity_wait_does_not_consume_generic_retry_budget(
         waiting = store.get_run(run["run_id"])
         assert waiting["retry_attempts"] == 0
         assert waiting["capacity_retry_count"] >= 1
-        assert waiting["failure_class"] == "host_worker_busy"
+        assert waiting["failure_class"] == "host_capacity"
         assert waiting["failure_retryable"] == 1
         assert (store.get_worker(worker["worker_id"]) or {})["state"] == "ready"
         wait_until(
@@ -2413,8 +2525,16 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path, monkeypatch):
     assert message_resp.status_code == 202
     message_run = wait_for_run(client, message_resp.json()["run_id"])
     assert message_run["state"] == "completed"
-    assert "Operator message" in message_run["instruction"]
-
+    assert "Preserve trusted requirements" in message_run["instruction"]
+    assert json.loads(message_run["continuation_context_json"]) == {
+        "version": 1,
+        "base_instruction": "Research the best path for workers and projects.",
+        "guidance": [
+            "Shift focus to Codex and Claude worker design details."
+        ],
+    }
+    assert "Research the best path for workers and projects." in message_run["instruction"]
+    assert "Shift focus to Codex and Claude worker design details." in message_run["instruction"]
     events_resp = client.get(f"/v1/workers/{worker_id}/events")
     assert events_resp.status_code == 200
     assert len(events_resp.json()["items"]) >= 6
@@ -2431,6 +2551,40 @@ def test_project_worker_lifecycle_with_stub_runtime(tmp_path, monkeypatch):
     assert metrics["runs"] == 2
     assert metrics["queued_runs"] == 0
     assert metrics["events"] >= 7
+
+
+def test_assign_idempotency_key_reuses_one_durable_run(tmp_path):
+    client = TestClient(create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime()))
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "synthetic-owner", "title": "Synthetic", "goal": "Test idempotency"},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={
+            "owner_id": "synthetic-owner",
+            "name": "Synthetic Worker",
+            "role": "general",
+            "profile": "openclaw-general",
+            "backend": "openclaw",
+        },
+    ).json()
+    headers = {"x-glasshive-idempotency-key": "scheduled-occurrence-synthetic"}
+    first = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=headers,
+        json={"instruction": "Perform the synthetic scheduled task."},
+    )
+    duplicate = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        headers=headers,
+        json={"instruction": "Perform the synthetic scheduled task."},
+    )
+    assert first.status_code == 202
+    assert duplicate.status_code == 202
+    assert duplicate.json()["run_id"] == first.json()["run_id"]
+    runs = client.get(f"/v1/workers/{worker['worker_id']}/runs").json()["items"]
+    assert [run["run_id"] for run in runs].count(first.json()["run_id"]) == 1
 
 
 def test_api_uses_configured_default_worker_profile_when_project_omits_it(tmp_path, monkeypatch):
@@ -2861,7 +3015,7 @@ def test_enterprise_opaque_signed_links_reject_tamper_expiry_and_mismatch(tmp_pa
     assert client.get(f"/v1/signed-links/{expired}").status_code == 401
 
 
-def test_enterprise_short_worker_view_ref_can_auto_resume_when_configured(tmp_path, monkeypatch):
+def test_enterprise_short_worker_view_ref_stays_read_only_when_legacy_auto_resume_is_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_MODE", "true")
     monkeypatch.setenv("GLASSHIVE_AUTH_MODE", "first_party_assertion")
     monkeypatch.setenv("GLASSHIVE_ENTERPRISE_TENANT_ID", "tenant-alpha")
@@ -2913,9 +3067,9 @@ def test_enterprise_short_worker_view_ref_can_auto_resume_when_configured(tmp_pa
     assert redirect.headers["location"] == f"https://glasshive-ui.example.test/watch/{worker['worker_id']}?surface=desktop"
     assert "gh_token=" not in redirect.headers["location"]
     live = client.get(f"/v1/workers/{worker['worker_id']}/live", headers=headers).json()
-    assert live["worker"]["state"] == "ready"
+    assert live["worker"]["state"] == "paused"
     assert any(event["event_type"] == "worker.view_opened" for event in live["events"])
-    assert any(event["event_type"] == "worker.resumed" for event in live["events"])
+    assert not any(event["event_type"] == "worker.resumed" for event in live["events"])
 
 
 def test_link_refs_are_redacted_deduplicated_and_secret_rotation_bound(monkeypatch):
@@ -3031,6 +3185,134 @@ def test_terminate_revokes_worker_link_refs(tmp_path, monkeypatch):
 
     assert client.post(f"/v1/workers/{worker['worker_id']}/terminate", headers=headers).status_code == 202
     assert resolve_signed_link_ref(ref_id) is None
+
+
+@pytest.mark.parametrize("ambient_runtime_db", ["unset", "mismatched"])
+def test_terminated_worker_artifact_credentials_fail_closed_when_revocation_sink_is_unavailable(
+    tmp_path,
+    monkeypatch,
+    ambient_runtime_db,
+):
+    """The app-bound worker row, not ambient/tombstone state, revokes old links."""
+
+    runtime_db = tmp_path / "authoritative" / "runtime.db"
+    missing_ambient_db = tmp_path / "ambient" / "wrong-runtime.db"
+    monkeypatch.setenv("WPR_API_TOKEN", "service-secret")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
+    if ambient_runtime_db == "unset":
+        monkeypatch.delenv("WPR_DB_PATH", raising=False)
+    else:
+        monkeypatch.setenv("WPR_DB_PATH", str(missing_ambient_db))
+
+    app = create_app(str(runtime_db), runtime_backend="stub", runtime=StubRuntime())
+    client = TestClient(app)
+    service_headers = {"X-WPR-Token": "service-secret"}
+    project = client.post(
+        "/v1/projects",
+        headers=service_headers,
+        json={
+            "owner_id": "demo-owner",
+            "title": "Authoritative link revocation",
+            "goal": "Reject every old artifact credential after termination.",
+        },
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=service_headers,
+        json={
+            "owner_id": "demo-owner",
+            "name": "Revocation worker",
+            "role": "writer",
+            "profile": "codex-cli",
+        },
+    ).json()
+    artifact = Path(worker["workspace_dir"]) / "result.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    secret_bytes = b"authoritative artifact bytes"
+    artifact.write_bytes(secret_bytes)
+
+    opaque_token = sign_link_token(
+        kind="artifact_download",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+        path="result.txt",
+    )
+    opaque_ref = create_signed_link_ref(token=opaque_token)
+    legacy_query = sign_link_params(
+        kind="artifact_download",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+        path="result.txt",
+    )
+    legacy_path = f"/v1/workers/{worker['worker_id']}/artifacts/download"
+    legacy_params = {"path": "result.txt", **legacy_query}
+    view_token = sign_link_token(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+    )
+    view_ref = create_signed_link_ref(
+        token=view_token,
+        target_url=f"/watch/{worker['worker_id']}?surface=desktop&gh_token={view_token}",
+    )
+    legacy_view_query = sign_link_params(
+        kind="worker_view",
+        worker_id=worker["worker_id"],
+        tenant_id=worker["tenant_id"],
+        owner_id=worker["owner_id"],
+    )
+
+    # The same credentials remain valid while their authoritative worker is live.
+    before_termination = (
+        client.get(f"/v1/signed-links/{opaque_token}"),
+        client.get(f"/v1/link-refs/{opaque_ref}"),
+        client.get(legacy_path, params=legacy_params),
+    )
+    assert [response.status_code for response in before_termination] == [200, 200, 200]
+    assert all(response.content == secret_bytes for response in before_termination)
+    assert client.get(
+        f"/v1/workers/{worker['worker_id']}/live",
+        params=legacy_view_query,
+    ).status_code == 200
+    assert client.get(f"/r/{view_ref}", follow_redirects=False).status_code == 307
+    assert client.get(f"/w/{view_ref}").status_code == 200
+
+    def fail_revocation_sink(_worker_id: str) -> int:
+        raise sqlite3.OperationalError("synthetic revocation sink failure")
+
+    monkeypatch.setitem(
+        WorkersProjectsService._apply_lifecycle_effect.__globals__,
+        "revoke_signed_link_refs_for_worker",
+        fail_revocation_sink,
+    )
+    terminated = client.post(
+        f"/v1/workers/{worker['worker_id']}/terminate",
+        headers=service_headers,
+    )
+    assert terminated.status_code == 202
+    assert app.state.store.get_worker(worker["worker_id"])["state"] == "terminated"
+    assert client.post(
+        f"/v1/workers/{worker['worker_id']}/view-opened",
+        headers=service_headers,
+    ).status_code != 204
+
+    after_termination = (
+        client.get(f"/v1/signed-links/{opaque_token}"),
+        client.get(f"/v1/link-refs/{opaque_ref}"),
+        client.get(legacy_path, params=legacy_params),
+    )
+    assert all(response.status_code != 200 for response in after_termination)
+    assert all(secret_bytes not in response.content for response in after_termination)
+    assert client.get(
+        f"/v1/workers/{worker['worker_id']}/live",
+        params=legacy_view_query,
+    ).status_code != 200
+    assert client.get(f"/r/{view_ref}", follow_redirects=False).status_code != 307
+    assert client.get(f"/w/{view_ref}").status_code != 200
+    assert not missing_ambient_db.exists()
 
 
 def test_enterprise_short_artifact_ref_is_auth_gated_and_durable_by_default(tmp_path, monkeypatch):
@@ -4497,6 +4779,11 @@ def test_max_run_duration_cancels_expired_run_and_releases_compute(
         assert refreshed_worker is not None and refreshed_worker["state"] == "paused"
         assert refreshed_worker["compute_released_at"]
         assert store.list_events(worker["worker_id"])[-1]["event_type"] == "run.duration_exceeded"
+        effects = store.list_lifecycle_operation_effects(worker_id=worker["worker_id"])
+        assert len(effects) == 1
+        assert effects[0]["operation_kind"] == "max_duration"
+        assert effects[0]["effect_kind"] == "callback.run_cancelled"
+        assert effects[0]["run_id"] == run["run_id"]
     finally:
         service.shutdown()
 
@@ -4757,7 +5044,7 @@ def test_duplicate_callback_without_durable_receipt_stays_pending(tmp_path, monk
         def raise_for_status(self):
             request = httpx.Request("POST", "http://callback.local/glasshive")
             response = httpx.Response(409, request=request)
-            raise httpx.HTTPStatusError("duplicate callback", request=request, response=response)
+            raise httpx.HTTPStatusError("callback conflict", request=request, response=response)
 
     def fake_post(url, *, content, headers, timeout):
         _ = url, content, headers, timeout
@@ -5311,7 +5598,7 @@ def test_persistent_local_scheduling_callback_404_dead_letters_after_budget(tmp_
     assert len(attempts) == 3
 
 
-def test_invalid_callback_payload_dead_letters_without_http(tmp_path, monkeypatch):
+def test_invalid_callback_payload_is_rejected_before_outbox_or_http(tmp_path, monkeypatch):
     def fake_post(url, *, content, headers, timeout):
         _ = url, content, headers, timeout
         raise AssertionError("invalid payload must not be posted")
@@ -5321,15 +5608,12 @@ def test_invalid_callback_payload_dead_letters_without_http(tmp_path, monkeypatc
     store = Store(str(tmp_path / "runtime.db"))
     service = WorkersProjectsService(store, StubRuntime())
     try:
-        _project, worker, _run, record = _create_callback_outbox_record(store, payload_json="{invalid")
-        service._deliver_callback_record(worker, store.list_pending_callbacks()[0], service._callback_config_for(worker))
+        with pytest.raises(ValueError, match="valid JSON"):
+            _create_callback_outbox_record(store, payload_json="{invalid")
     finally:
         service.shutdown()
 
-    row = _callback_row(store, record["callback_id"])
-    assert row["status"] == "dead_lettered"
-    assert row["attempts"] == 1
-    assert "invalid callback payload json" in row["last_error"]
+    assert store.list_pending_callbacks() == []
 
 
 def test_missing_callback_url_dead_letters_immediately(tmp_path, monkeypatch):
@@ -5408,8 +5692,12 @@ def test_metrics_include_callback_outbox_health(tmp_path):
             "UPDATE callback_outbox SET status = 'delivering', attempts = 3 WHERE callback_id = ?",
             (delivering["callback_id"],),
         )
+    dead_letter_claim = store.claim_pending_callback(dead_lettered["callback_id"])
+    assert dead_letter_claim is not None
     store.mark_callback_dead_lettered(
         dead_lettered["callback_id"],
+        lease_token=dead_letter_claim["delivery_lease_token"],
+        delivery_generation=dead_letter_claim["delivery_generation"],
         attempts=99,
         payload_json=str(dead_lettered["payload_json"]),
         last_error="terminal test callback",
@@ -5525,6 +5813,667 @@ def test_callback_config_recovers_runtime_env_url_and_secret(tmp_path, monkeypat
     assert "runtime-secret" not in caplog.text
 
 
+def test_startup_reconcile_repairs_parallel_mission_networks_before_work_recovery(
+    tmp_path,
+):
+    class RepairingRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def repair_parallel_clean_room_mission_networks(self) -> tuple[str, ...]:
+            self.repairs += 1
+            return ("synthetic-mission-network",)
+
+    runtime = RepairingRuntime()
+    service = WorkersProjectsService(
+        Store(str(tmp_path / "runtime.db")),
+        runtime,
+        reconcile_on_startup=True,
+    )
+    try:
+        assert runtime.repairs == 1
+    finally:
+        service.shutdown()
+
+
+def test_startup_reconcile_does_not_postpone_idle_compute_release(tmp_path, monkeypatch):
+    class RestartReaperRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.terminated: list[str] = []
+
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.workspace_dir = str(worker.get("workspace_dir") or "")
+            return info
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(str(worker["worker_id"]))
+            info = super().ensure_worker_ready(worker)
+            info.pid = None
+            info.workspace_dir = str(worker.get("workspace_dir") or "")
+            return info
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "1")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Restart Idle Reaper",
+        "Release retained compute after a service restart.",
+        "openclaw-general",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Completed Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    retained_workspace = tmp_path / "retained-workspace"
+    retained_workspace.mkdir()
+    store.update_worker(
+        worker["worker_id"],
+        workspace_dir=str(retained_workspace),
+    )
+    completed_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    run = create_truthfully_invoked_test_run(
+        store,
+        worker,
+        project["project_id"],
+        "Complete before restart",
+        suffix="restart-idle-reaper",
+    )
+    store.update_run(
+        run["run_id"],
+        state="completed",
+        ended_at=completed_at.isoformat(),
+        output_text="Synthetic completed result",
+    )
+    store.update_worker(
+        worker["worker_id"],
+        state="completed",
+        last_run_id=run["run_id"],
+    )
+    idle_at = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (idle_at, worker["worker_id"]),
+        )
+
+    runtime = RestartReaperRuntime()
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        reconcile_on_startup=True,
+        start_background_consumers=False,
+    )
+    try:
+        service.reconcile_all_workers()
+        reconciled = store.get_worker(worker["worker_id"])
+        assert reconciled is not None
+        assert reconciled["updated_at"] == idle_at
+        workspace_dir = reconciled["workspace_dir"]
+
+        reaped = service.reap_idle_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert runtime.terminated == [worker["worker_id"]]
+        released = store.get_worker(worker["worker_id"])
+        assert released is not None
+        assert released["state"] == "completed"
+        assert released["compute_released_at"]
+        assert released["workspace_dir"] == workspace_dir
+        assert (store.get_run(run["run_id"]) or {})["state"] == "completed"
+    finally:
+        service.shutdown()
+
+
+def test_idle_reaper_uses_terminal_run_end_after_restart_lifecycle_refresh(
+    tmp_path,
+    monkeypatch,
+):
+    class RestartRefreshedRuntime(StubRuntime):
+        def __init__(self) -> None:
+            self.terminated: list[str] = []
+
+        def terminate_worker(self, worker: dict) -> RuntimeInfo:
+            self.terminated.append(str(worker["worker_id"]))
+            info = super().ensure_worker_ready(worker)
+            info.pid = None
+            return info
+
+    monkeypatch.setenv("GLASSHIVE_IDLE_TERMINATE_AFTER_S", "60")
+    monkeypatch.setenv("GLASSHIVE_IDLE_REAPER_INTERVAL_S", "3600")
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Restart Refreshed Idle Reaper",
+        "Release terminal compute even when lifecycle reconciliation refreshed the worker row.",
+        "openclaw-general",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Cancelled Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    ended_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    run = create_truthfully_invoked_test_run(
+        store,
+        worker,
+        project["project_id"],
+        "Cancel before restart",
+        suffix="restart-terminal-reaper",
+    )
+    store.update_run(
+        run["run_id"],
+        state="cancelled",
+        ended_at=ended_at.isoformat(),
+    )
+    store.update_worker(
+        worker["worker_id"],
+        state="ready",
+        last_run_id=run["run_id"],
+    )
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET updated_at = ? WHERE worker_id = ?",
+            (datetime.now(timezone.utc).isoformat(), worker["worker_id"]),
+        )
+
+    runtime = RestartRefreshedRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        reaped = service.reap_idle_workers_once()
+
+        assert [item["worker_id"] for item in reaped] == [worker["worker_id"]]
+        assert runtime.terminated == [worker["worker_id"]]
+        released = store.get_worker(worker["worker_id"])
+        assert released is not None
+        assert released["compute_released_at"]
+        assert (store.get_run(run["run_id"]) or {})["state"] == "cancelled"
+    finally:
+        service.shutdown()
+
+
+def test_startup_reconcile_keeps_capacity_queued_worker_retry_eligible(tmp_path):
+    class MissingProcessRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Restart Capacity Retry",
+        "Resume queued capacity work after restart.",
+        "openclaw-general",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    # Reproduce the durable state left by the older startup reconciler: the
+    # capacity-wait run is still queued, but its no-PID worker was persisted paused.
+    store.update_worker_state(worker["worker_id"], "paused")
+    assert (store.get_worker(worker["worker_id"]) or {})["pid"] is None
+    run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Retry after host capacity recovers",
+        state="queued",
+    )
+    retry_after = datetime.now(timezone.utc) + timedelta(days=1)
+    store.update_run(
+        run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    alias_resumed_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Alias Resumed Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.add_event(
+        project["project_id"],
+        alias_resumed_worker["worker_id"],
+        None,
+        "worker.paused",
+        "Worker paused",
+    )
+    store.add_event(
+        project["project_id"],
+        alias_resumed_worker["worker_id"],
+        None,
+        "worker.resumed_by_alias",
+        "Worker resumed by alias",
+    )
+    store.update_worker_state(alias_resumed_worker["worker_id"], "paused")
+    alias_resumed_run = store.create_run(
+        alias_resumed_worker["worker_id"],
+        project["project_id"],
+        "Resume the alias-reused capacity wait after legacy reconcile",
+        state="queued",
+    )
+    store.update_run(
+        alias_resumed_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    paused_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Operator Paused Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(paused_worker["worker_id"], "paused")
+    paused_run = store.create_run(
+        paused_worker["worker_id"],
+        project["project_id"],
+        "Stay paused despite persisted capacity retry",
+        state="paused",
+    )
+    store.update_run(
+        paused_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+    store.add_event(
+        project["project_id"],
+        paused_worker["worker_id"],
+        paused_run["run_id"],
+        "worker.paused",
+        "Worker paused",
+    )
+    paused_sibling = store.create_run(
+        paused_worker["worker_id"],
+        project["project_id"],
+        "Queued capacity sibling must not override the paused mission",
+        state="queued",
+    )
+    store.update_run(
+        paused_sibling["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    incomplete_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Incomplete Capacity Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(incomplete_worker["worker_id"], "paused")
+    incomplete_run = store.create_run(
+        incomplete_worker["worker_id"],
+        project["project_id"],
+        "Do not infer retry eligibility from a capacity label alone",
+        state="queued",
+    )
+    store.update_run(
+        incomplete_run["run_id"],
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    stale_class_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Stale Capacity Class Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(stale_class_worker["worker_id"], "paused")
+    stale_class_run = store.create_run(
+        stale_class_worker["worker_id"],
+        project["project_id"],
+        "Do not recover a retry whose current failure is not capacity",
+        state="queued",
+    )
+    store.update_run(
+        stale_class_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="provider_temporarily_unavailable",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    manual_idle_worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Manually Paused Idle Worker",
+        role="research",
+        profile="openclaw-general",
+        backend="openclaw",
+        runtime="openclaw",
+        model="stub/general",
+    )
+    store.update_worker_state(manual_idle_worker["worker_id"], "paused")
+    store.add_event(
+        project["project_id"],
+        manual_idle_worker["worker_id"],
+        None,
+        "worker.paused",
+        "Worker paused",
+    )
+    manual_idle_run = store.create_run(
+        manual_idle_worker["worker_id"],
+        project["project_id"],
+        "A capacity queue must not resume an explicit idle pause",
+        state="queued",
+    )
+    store.update_run(
+        manual_idle_run["run_id"],
+        retry_after=retry_after.isoformat(),
+        retry_attempts=1,
+        last_retry_class="host_capacity",
+        failure_class="host_capacity",
+        failure_retryable=1,
+        failure_structured=1,
+    )
+
+    service = WorkersProjectsService(
+        store,
+        MissingProcessRuntime(),
+        reconcile_on_startup=True,
+    )
+    try:
+        wait_until(
+            lambda: (store.get_worker(worker["worker_id"]) or {}).get("state")
+            == "ready"
+        )
+        reconciled = store.get_worker(worker["worker_id"])
+        assert reconciled is not None
+        assert reconciled["state"] == "ready"
+        assert (store.get_worker(alias_resumed_worker["worker_id"]) or {})["state"] == "ready"
+        assert (store.get_worker(paused_worker["worker_id"]) or {})["state"] == "paused"
+        assert (store.get_worker(incomplete_worker["worker_id"]) or {})["state"] == "paused"
+        assert (store.get_worker(stale_class_worker["worker_id"]) or {})["state"] == "paused"
+        assert (store.get_worker(manual_idle_worker["worker_id"]) or {})["state"] == "paused"
+        due_after_restart = store.list_due_retry_worker_ids(
+            now_iso=(retry_after + timedelta(seconds=1)).isoformat()
+        )
+        assert set(due_after_restart) == {
+            worker["worker_id"],
+            alias_resumed_worker["worker_id"],
+        }
+        queued = store.get_run(run["run_id"])
+        assert queued is not None
+        assert queued["state"] == "queued"
+        assert queued["failure_class"] == "host_capacity"
+        assert queued["retry_after"] == retry_after.isoformat()
+    finally:
+        service.shutdown()
+
+
+def test_startup_reconcile_restarts_crash_requeued_run_but_preserves_operator_pause(
+    tmp_path,
+):
+    class MissingReconcileProcessRuntime(StubRuntime):
+        def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+            info = super().reconcile_worker(worker)
+            info.pid = None
+            return info
+
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Crash Restart Recovery",
+        "Restart work whose prior dispatch ownership was lost.",
+        "codex-cli",
+    )
+
+    def crashed_running_worker(name: str, suffix: str) -> tuple[dict, dict]:
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name=name,
+            role="host worker",
+            profile="codex-cli",
+            backend="codex-cli",
+            runtime="codex-cli",
+            model="stub/codex-cli",
+        )
+        run = create_truthfully_invoked_test_run(
+            store,
+            worker,
+            project["project_id"],
+            f"Finish {suffix} after process restart",
+            suffix=suffix,
+            executor_id=f"crashed-executor-{suffix}",
+        )
+        lease = store.get_active_host_run_lease_for_run(run["run_id"])
+        assert lease is not None
+        released = store.release_host_run_lease(
+            lease["lease_id"],
+            executor_id=f"crashed-executor-{suffix}",
+            reason="synthetic_process_crash",
+        )
+        assert released is not None
+        return worker, run
+
+    _, automatic_run = crashed_running_worker(
+        "Automatically Recovered Worker", "automatic"
+    )
+    paused_worker, paused_run = crashed_running_worker(
+        "Operator Paused Worker", "operator-paused"
+    )
+    failed_paused_worker, failed_paused_run = crashed_running_worker(
+        "Failed State Operator Paused Worker", "failed-operator-paused"
+    )
+    store.add_event(
+        project["project_id"],
+        paused_worker["worker_id"],
+        paused_run["run_id"],
+        "worker.paused",
+        "Worker paused",
+    )
+    # Reproduce a crash split where durable operator intent landed before the
+    # worker/run projection. Startup must honor that event from any worker state.
+    assert (store.get_worker(paused_worker["worker_id"]) or {})["state"] == "running"
+    store.add_event(
+        project["project_id"],
+        failed_paused_worker["worker_id"],
+        failed_paused_run["run_id"],
+        "worker.paused",
+        "Worker paused",
+    )
+    store.update_worker_state(failed_paused_worker["worker_id"], "failed")
+
+    service = WorkersProjectsService(
+        store,
+        MissingReconcileProcessRuntime(),
+        reconcile_on_startup=True,
+    )
+    try:
+        wait_until(
+            lambda: (store.get_run(automatic_run["run_id"]) or {}).get("state")
+            == "completed",
+            timeout=3,
+        )
+
+        recovered = store.get_run(automatic_run["run_id"])
+        assert recovered is not None
+        assert recovered["output_text"].startswith("STUB_OK:")
+        recovered_attempts = store.list_run_attempts(automatic_run["run_id"])
+        assert [attempt["state"] for attempt in recovered_attempts] == [
+            "retry_queued",
+            "completed",
+        ]
+        assert recovered_attempts[0]["terminal_reason"] == (
+            "running_invariant_reconciled"
+        )
+
+        preserved = store.get_run(paused_run["run_id"])
+        assert preserved is not None
+        assert preserved["state"] == "queued"
+        assert preserved["last_retry_class"] == "running_invariant_reconciled"
+        assert (store.get_worker(paused_worker["worker_id"]) or {})["state"] == (
+            "paused"
+        )
+        assert len(store.list_run_attempts(paused_run["run_id"])) == 1
+        failed_preserved = store.get_run(failed_paused_run["run_id"])
+        assert failed_preserved is not None
+        assert failed_preserved["state"] == "queued"
+        assert (store.get_worker(failed_paused_worker["worker_id"]) or {})[
+            "state"
+        ] == "paused"
+        assert len(store.list_run_attempts(failed_paused_run["run_id"])) == 1
+    finally:
+        service.shutdown()
+
+
+def test_restart_retry_reconciliation_cannot_overwrite_concurrent_operator_pause(
+    tmp_path,
+    monkeypatch,
+):
+    class NoSchedulerWorkersProjectsService(WorkersProjectsService):
+        def _process_scheduler_cycle(self) -> None:
+            return
+
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner",
+        "Atomic Restart Recovery",
+        "Preserve operator control while restart recovery races.",
+        "codex-cli",
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Concurrently Paused Worker",
+        role="host worker",
+        profile="codex-cli",
+        backend="codex-cli",
+        runtime="codex-cli",
+        model="stub/codex-cli",
+    )
+    run = create_truthfully_invoked_test_run(
+        store,
+        worker,
+        project["project_id"],
+        "Do not resume after the operator pause wins.",
+        suffix="concurrent-pause",
+        executor_id="crashed-executor-concurrent-pause",
+    )
+    lease = store.get_active_host_run_lease_for_run(run["run_id"])
+    assert lease is not None
+    assert store.release_host_run_lease(
+        lease["lease_id"],
+        executor_id="crashed-executor-concurrent-pause",
+        reason="synthetic_process_crash",
+    )
+
+    service = NoSchedulerWorkersProjectsService(
+        store,
+        StubRuntime(),
+        reconcile_on_startup=False,
+    )
+    monkeypatch.setattr(service, "_ensure_worker_processor", lambda _worker_id: None)
+    entered_retry_projection = Event()
+    allow_retry_projection = Event()
+    original_reconcile = store.reconcile_automatic_retry_worker
+
+    def reconcile_after_concurrent_pause(worker_id: str):
+        entered_retry_projection.set()
+        assert allow_retry_projection.wait(2)
+        return original_reconcile(worker_id)
+
+    monkeypatch.setattr(
+        store,
+        "reconcile_automatic_retry_worker",
+        reconcile_after_concurrent_pause,
+    )
+    errors: list[BaseException] = []
+
+    def reconcile() -> None:
+        try:
+            service.reconcile_all_workers()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=reconcile)
+    thread.start()
+    try:
+        assert entered_retry_projection.wait(2)
+        store.add_event(
+            project["project_id"],
+            worker["worker_id"],
+            run["run_id"],
+            "worker.paused",
+            "Worker paused",
+        )
+        store.update_worker_state(worker["worker_id"], "paused")
+        allow_retry_projection.set()
+        thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert (store.get_worker(worker["worker_id"]) or {})["state"] == "paused"
+        durable_run = store.get_run(run["run_id"])
+        assert durable_run is not None
+        assert durable_run["state"] == "queued"
+        assert durable_run["last_retry_class"] == "running_invariant_reconciled"
+        assert len(store.list_run_attempts(run["run_id"])) == 1
+    finally:
+        allow_retry_projection.set()
+        thread.join(timeout=2)
+        service.shutdown()
+
+
 def test_reconcile_interrupts_active_run_when_worker_process_is_missing(tmp_path):
     class MissingProcessRuntime(StubRuntime):
         def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
@@ -5634,19 +6583,29 @@ def test_passive_rehearsal_does_not_run_callbacks_schedules_or_reapers(tmp_path,
             }
         },
     )
-    store.upsert_callback_outbox(
-        callback_id="cb_passive_rehearsal",
-        project_id=project["project_id"],
-        worker_id=worker["worker_id"],
-        run_id=None,
-        event_type="run.completed",
-        url="https://callback.example.test/glasshive",
-        payload_json=json.dumps({"callback_id": "cb_passive_rehearsal", "event": "run.completed"}),
+    retained_run = store.create_run(
+        worker["worker_id"],
+        project["project_id"],
+        "Retained completed work",
+        state="completed",
     )
 
     service = WorkersProjectsService(store, StubRuntime())
     try:
-        service._emit_callback(worker, "run.started", message="Do not deliver from rehearsal")
+        service._emit_callback(
+            worker,
+            "run.completed",
+            run=retained_run,
+            message="Do not deliver from rehearsal",
+            submit_delivery=False,
+        )
+        service._emit_callback(
+            worker,
+            "run.started",
+            run=retained_run,
+            message="Do not deliver from rehearsal",
+            submit_delivery=False,
+        )
         service.create_recurring_schedule(
             worker["worker_id"],
             "Do not execute from rehearsal",
@@ -5662,7 +6621,9 @@ def test_passive_rehearsal_does_not_run_callbacks_schedules_or_reapers(tmp_path,
     pending_callbacks = store.list_pending_callbacks(limit=10)
     assert len(pending_callbacks) == 2
     assert {record["status"] for record in pending_callbacks} == {"pending"}
-    assert store.list_runs_for_worker(worker["worker_id"]) == []
+    assert [item["run_id"] for item in store.list_runs_for_worker(worker["worker_id"])] == [
+        retained_run["run_id"]
+    ]
     assert service._callback_retry_thread is None
     assert service._idle_reaper_thread is None
     assert service._scheduler_thread is None
@@ -5674,13 +6635,20 @@ def test_reconcile_orphaned_running_run_emits_interrupted_callback(
     class MissingProcessRuntime(StubRuntime):
         def reconcile_worker(self, worker: dict) -> RuntimeInfo:
             info = super().reconcile_worker(worker)
+            # A host CLI can exit before its processor has parsed and durably stored the
+            # successful result. During that finalization window there is no live PID.
             info.pid = None
             return info
 
     store = Store(str(tmp_path / "runtime.db"))
-    service = WorkersProjectsService(store, MissingProcessRuntime())
+    service = WorkersProjectsService(store, MissingProcessRuntime(), reconcile_on_startup=False)
     try:
-        project = store.create_project("owner", "Orphan Callback", "Notify parent on orphaned run", "codex-cli")
+        project = store.create_project(
+            "owner",
+            "Finalization Race",
+            "Do not orphan a locally owned run while its result is being finalized",
+            "codex-cli",
+        )
         worker = store.create_worker(
             project_id=project["project_id"],
             owner_id="owner",
@@ -5690,16 +6658,6 @@ def test_reconcile_orphaned_running_run_emits_interrupted_callback(
             backend="openclaw",
             runtime="codex-cli",
             model="gpt-5.4",
-            bootstrap_bundle={
-                "callbacks": {
-                    "events_webhook_url": "http://callback.local/glasshive",
-                    "hmac_secret": "callback-secret",
-                    "conversation_id": "conv-1",
-                    "parent_message_id": "msg-user",
-                    "message_id": "msg-assistant",
-                    "surface": "web",
-                }
-            },
         )
         store.update_worker_state(worker["worker_id"], "running")
         run = store.create_run(
@@ -5709,16 +6667,297 @@ def test_reconcile_orphaned_running_run_emits_interrupted_callback(
             state=RunRestorationState.RUNNING,
         )
 
+        with service._processors_lock:
+            service._active_processors.add(worker["worker_id"])
+
         service.reconcile_all_workers()
     finally:
+        with service._processors_lock:
+            service._active_processors.discard(worker["worker_id"])
         service.shutdown()
 
-    callbacks = [row for row in store.list_pending_callbacks() if row["run_id"] == run["run_id"]]
-    assert len(callbacks) == 1
-    payload = json.loads(callbacks[0]["payload_json"])
-    assert payload["event"] == "run.interrupted"
-    assert payload["run_state"] == "interrupted"
-    assert "not running during reconcile" in payload["message"]
+    reconciled_run = store.get_run(run["run_id"])
+    assert reconciled_run["state"] == "running"
+    assert store.get_worker(worker["worker_id"])["state"] == "running"
+    assert not any(
+        event["event_type"] == "run.orphaned"
+        for event in store.list_events(worker["worker_id"])
+    )
+
+
+def test_foreign_reconcile_preserves_run_owned_by_live_recorded_host_process(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime_root = tmp_path / "runtime-state"
+    store = Store(str(db_path))
+    owner_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    foreign_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    service = WorkersProjectsService(store, foreign_runtime, reconcile_on_startup=False)
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        project = store.create_project(
+            "owner",
+            "Cross-process ownership",
+            "Do not orphan a host run owned by another service instance",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            execution_mode="host",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        workspace_dir = tmp_path / "live-owner-workspace"
+        workspace_dir.mkdir()
+        store.update_worker(worker["worker_id"], workspace_dir=str(workspace_dir))
+        worker = store.get_worker(worker["worker_id"]) or worker
+        store.update_worker_state(worker["worker_id"], "running")
+        run = create_truthfully_invoked_test_run(
+            store,
+            worker,
+            project["project_id"],
+            "Long host task",
+            suffix="foreign-live-owner",
+        )
+        heartbeat_path = tmp_path / "active-run.json"
+        heartbeat_path.write_text(
+            json.dumps(
+                {
+                    "schema": "glasshive.active_run.v1",
+                    "run_id": run["run_id"],
+                    "state": "running",
+                    "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                    "process_pid": process.pid,
+                }
+            )
+        )
+        owner_runtime._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run['run_id'][:12]}",
+                "run_id": run["run_id"],
+                "process_pid": process.pid,
+                "owner_pid": os.getpid(),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "stdout_path": str(tmp_path / "still-running.stdout.log"),
+                "stderr_path": str(tmp_path / "still-running.stderr.log"),
+                "exit_path": str(tmp_path / "still-running.exit-code"),
+                "heartbeat_path": str(heartbeat_path),
+            },
+        )
+
+        assert foreign_runtime._active_pid(worker["worker_id"], run["run_id"]) == process.pid
+        service.reconcile_all_workers()
+
+        assert store.get_run(run["run_id"])["state"] == "running"
+        assert store.get_worker(worker["worker_id"])["state"] == "running"
+        assert not any(
+            event["event_type"] == "run.orphaned"
+            for event in store.list_events(worker["worker_id"])
+        )
+        assert not any(
+            event["event_type"] == "worker.reconcile_failed"
+            for event in store.list_events(worker["worker_id"])
+        )
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+        owner_runtime._clear_active_session(worker["worker_id"] if "worker" in locals() else "")
+        service.shutdown()
+
+
+def test_foreign_reconcile_rejects_live_child_when_owner_process_is_gone(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime_root = tmp_path / "runtime-state"
+    store = Store(str(db_path))
+    owner_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    foreign_runtime = HostCodexCliRuntime(base_dir=str(runtime_root))
+    service = WorkersProjectsService(store, foreign_runtime, reconcile_on_startup=False)
+    child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    exited_owner = subprocess.Popen(["true"])
+    exited_owner.wait(timeout=5)
+    try:
+        project = store.create_project(
+            "owner",
+            "Expired cross-process owner",
+            "Do not preserve a child process after its owning service exits",
+            "codex-cli",
+        )
+        worker = store.create_worker(
+            project_id=project["project_id"],
+            owner_id="owner",
+            name="Codex Host",
+            role="host worker",
+            profile="codex-cli",
+            execution_mode="host",
+            backend="openclaw",
+            runtime="codex-cli",
+            model="gpt-5.6-sol",
+        )
+        workspace_dir = tmp_path / "dead-owner-workspace"
+        workspace_dir.mkdir()
+        store.update_worker(worker["worker_id"], workspace_dir=str(workspace_dir))
+        worker = store.get_worker(worker["worker_id"]) or worker
+        store.update_worker_state(worker["worker_id"], "running")
+        run = create_truthfully_invoked_test_run(
+            store,
+            worker,
+            project["project_id"],
+            "Host task whose service owner exited",
+            suffix="foreign-dead-owner",
+        )
+        heartbeat_path = tmp_path / "expired-owner-active-run.json"
+        heartbeat_path.write_text(
+            json.dumps(
+                {
+                    "schema": "glasshive.active_run.v1",
+                    "run_id": run["run_id"],
+                    "state": "running",
+                    "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                    "process_pid": child.pid,
+                }
+            )
+        )
+        owner_runtime._write_active_session(
+            worker["worker_id"],
+            {
+                "session_name": f"conversation-{run['run_id'][:12]}",
+                "run_id": run["run_id"],
+                "process_pid": child.pid,
+                "owner_pid": exited_owner.pid,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "stdout_path": str(tmp_path / "expired-owner.stdout.log"),
+                "stderr_path": str(tmp_path / "expired-owner.stderr.log"),
+                "exit_path": str(tmp_path / "expired-owner.exit-code"),
+                "heartbeat_path": str(heartbeat_path),
+            },
+        )
+
+        assert foreign_runtime._active_pid(worker["worker_id"], run["run_id"]) is None
+        service.reconcile_all_workers()
+
+        interrupted = store.get_run(run["run_id"])
+        assert interrupted["state"] == "interrupted"
+        assert interrupted["failure_class"] == "provider_temporarily_unavailable"
+        assert interrupted["failure_retryable"] == 1
+        assert interrupted["failure_structured"] == 1
+        wait_until(lambda: child.poll() is not None)
+        assert owner_runtime._read_active_session(worker["worker_id"]) is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+        owner_runtime._clear_active_session(worker["worker_id"] if "worker" in locals() else "")
+        service.shutdown()
+
+
+def test_fresh_owner_heartbeat_preserves_cross_process_finalization_lease(tmp_path):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime-state"))
+    child = subprocess.Popen(["true"], start_new_session=True)
+    child.wait(timeout=5)
+    worker_id = "wrk_finalization_lease"
+    run_id = "run_finalization_lease"
+    heartbeat_path = tmp_path / "finalization-active-run.json"
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "schema": "glasshive.active_run.v1",
+                "run_id": run_id,
+                "state": "running",
+                "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                "process_pid": child.pid,
+            }
+        )
+    )
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": f"conversation-{run_id[:12]}",
+            "run_id": run_id,
+            "process_pid": child.pid,
+            "owner_pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "heartbeat_path": str(heartbeat_path),
+        },
+    )
+    try:
+        assert runtime._active_pid(worker_id, run_id) == child.pid
+    finally:
+        runtime._clear_active_session(worker_id)
+
+
+def test_stale_owner_heartbeat_cannot_pin_a_reused_live_pid(tmp_path):
+    runtime = HostCodexCliRuntime(base_dir=str(tmp_path / "runtime-state"))
+    unrelated_process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    worker_id = "wrk_stale_lease"
+    run_id = "run_stale_lease"
+    heartbeat_path = tmp_path / "stale-active-run.json"
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "schema": "glasshive.active_run.v1",
+                "run_id": run_id,
+                "state": "running",
+                "last_heartbeat_at": "2000-01-01T00:00:00+00:00",
+                "process_pid": unrelated_process.pid,
+            }
+        )
+    )
+    runtime._write_active_session(
+        worker_id,
+        {
+            "session_name": f"conversation-{run_id[:12]}",
+            "run_id": run_id,
+            "process_pid": unrelated_process.pid,
+            "owner_pid": os.getpid(),
+            "started_at": "2000-01-01T00:00:00+00:00",
+            "heartbeat_path": str(heartbeat_path),
+        },
+    )
+    try:
+        assert runtime._active_pid(worker_id, run_id) is None
+    finally:
+        unrelated_process.terminate()
+        unrelated_process.wait(timeout=5)
+        runtime._clear_active_session(worker_id)
+
+
+def test_reconcile_unproven_running_run_downgrades_without_callback(tmp_path):
+    store = Store(str(tmp_path / "runtime.db"))
+    project = store.create_project(
+        "owner", "Orphan Callback", "Preserve truthful pre-dispatch state", "codex-cli"
+    )
+    worker = store.create_worker(
+        project_id=project["project_id"],
+        owner_id="owner",
+        name="Codex Host",
+        role="host worker",
+        profile="codex-cli",
+        backend="openclaw",
+        runtime="codex-cli",
+        model="gpt-5.4",
+        bootstrap_bundle={
+            "callbacks": {
+                "events_webhook_url": "http://callback.local/glasshive",
+                "hmac_secret": "callback-secret",
+            }
+        },
+    )
+    run = store.create_run(
+        worker["worker_id"], project["project_id"], "Long host task"
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE runs SET state = 'running' WHERE run_id = ?",
+            (run["run_id"],),
+        )
+
+    assert store.reconcile_invalid_running_runs() == 1
+    assert store.get_run(run["run_id"])["state"] == "queued"
+    assert store.list_pending_callbacks() == []
 
 
 def test_reconcile_collects_completed_run_before_orphaning_missing_process(
@@ -5875,17 +7114,19 @@ def test_reconcile_continues_when_one_completed_run_collection_raises(
         )
         store.update_worker_state(broken_worker["worker_id"], "running")
         store.update_worker_state(healthy_worker["worker_id"], "running")
-        broken_run = store.create_run(
-            broken_worker["worker_id"],
+        broken_run = create_truthfully_invoked_test_run(
+            store,
+            broken_worker,
             project["project_id"],
             "Broken host task",
-            state=RunRestorationState.RUNNING,
+            suffix="broken-collection",
         )
-        healthy_run = store.create_run(
-            healthy_worker["worker_id"],
+        healthy_run = create_truthfully_invoked_test_run(
+            store,
+            healthy_worker,
             project["project_id"],
             "Healthy host task",
-            state=RunRestorationState.RUNNING,
+            suffix="healthy-collection",
         )
 
         service.reconcile_all_workers()
@@ -5902,14 +7143,19 @@ def test_reconcile_continues_when_one_completed_run_collection_raises(
     )
 
 
-def test_reconcile_skips_idle_paused_workers_and_cleans_inconsistent_runs(tmp_path):
+def test_reconcile_skips_idle_paused_workers_and_repairs_inconsistent_runs(tmp_path):
     class CountingRuntime(StubRuntime):
         def __init__(self) -> None:
             self.reconciled_worker_ids: list[str] = []
+            self.paused_worker_ids: list[str] = []
 
         def reconcile_worker(self, worker: dict) -> RuntimeInfo:
             self.reconciled_worker_ids.append(worker["worker_id"])
             return super().reconcile_worker(worker)
+
+        def pause_worker(self, worker: dict) -> RuntimeInfo:
+            self.paused_worker_ids.append(worker["worker_id"])
+            return super().pause_worker(worker)
 
     store = Store(str(tmp_path / "runtime.db"))
     project = store.create_project("owner", "Startup Efficiency", "Avoid Docker scans for paused workspaces", "codex-cli")
@@ -5943,26 +7189,32 @@ def test_reconcile_skips_idle_paused_workers_and_cleans_inconsistent_runs(tmp_pa
         runtime="codex-cli",
         model="gpt-5.4",
     )
-    store.update_worker_state(paused_idle["worker_id"], "paused")
-    store.update_worker_state(ready_worker["worker_id"], "ready")
-    active_run = store.create_run(
-        paused_with_run["worker_id"],
+    active_run = create_truthfully_invoked_test_run(
+        store,
+        paused_with_run,
         project["project_id"],
         "stale run",
-        state=RunRestorationState.RUNNING,
+        suffix="paused-reconcile",
     )
+    store.update_worker_state(paused_idle["worker_id"], "paused")
+    store.update_worker_state(ready_worker["worker_id"], "ready")
     store.update_worker_state(paused_with_run["worker_id"], "paused")
 
     runtime = CountingRuntime()
-    service = WorkersProjectsService(store, runtime)
+    service = WorkersProjectsService(
+        store,
+        runtime,
+        start_background_consumers=False,
+    )
     try:
-        pass
+        service.reconcile_all_workers()
     finally:
         service.shutdown()
 
     assert runtime.reconciled_worker_ids == [ready_worker["worker_id"]]
-    assert store.get_run(active_run["run_id"])["state"] == "interrupted"
-    assert any(event["event_type"] == "run.orphaned" for event in store.list_events(paused_with_run["worker_id"]))
+    assert runtime.paused_worker_ids == [paused_with_run["worker_id"]]
+    assert store.get_run(active_run["run_id"])["state"] == "paused"
+    assert any(event["event_type"] == "run.paused" for event in store.list_events(paused_with_run["worker_id"]))
 
 
 def test_reconcile_does_not_regress_completed_run_when_process_is_missing(
@@ -6039,6 +7291,919 @@ def test_worker_find_or_resume_reuses_alias_and_preserves_host_fields(tmp_path):
     assert second.json()["execution_mode"] == "host"
     assert second.json()["alias"] == "codex-main"
     assert second.json()["workspace_root"] == str(tmp_path / "workspaces")
+
+
+def _scheduled_workbench_worker_payload(
+    *,
+    run_id: str,
+    alias: str = "health-context",
+    fallback: dict[str, str] | None = None,
+) -> dict:
+    fallback_route = fallback if fallback is not None else {
+        "worker_profile": "claude-code",
+        "model": "stub/claude-code",
+        "reasoning_effort": "max",
+    }
+    payload = {
+        "owner_id": "synthetic-owner",
+        "name": "Scheduled health context",
+        "role": "Execute one private scheduled prompt.",
+        "profile": "codex-cli",
+        "backend": "codex-cli",
+        "execution_mode": "docker",
+        "alias": alias,
+        "bootstrap_profile": "prompt-workbench-scheduled-v1",
+        "bootstrap_bundle": {
+            "viventium_execution_authority_request": {
+                "version": 1,
+                "kind": "prompt_workbench_scheduled",
+                "execution_mode": "docker",
+                "primary": {
+                    "worker_profile": "codex-cli",
+                    "model": "stub/codex-cli",
+                    "reasoning_effort": "xhigh",
+                },
+                **({"fallback": fallback_route} if fallback_route else {}),
+            },
+            "callbacks": {
+                "events_webhook_url": (
+                    "http://127.0.0.1:7010/internal/scheduled-prompts/"
+                    "glasshive-callback"
+                ),
+                "hmac_secret": "synthetic-callback-secret",
+                "user_id": "synthetic-owner",
+                "conversation_id": "workbench-scheduled-prompt:synthetic-task",
+                "parent_message_id": "scheduled-prompt:synthetic-task",
+                "message_id": run_id,
+                "surface": "workbench",
+                "scheduled_prompt_run_id": run_id,
+                "scheduled_prompt_task_id": "synthetic-task",
+            },
+            "env": {
+                "WPR_CODEX_CLI_REASONING_EFFORT": "xhigh",
+                **(
+                    {"WPR_CLAUDE_CODE_EFFORT": fallback_route["reasoning_effort"]}
+                    if fallback_route
+                    and fallback_route["worker_profile"] == "claude-code"
+                    else {}
+                ),
+            },
+            "agents_md": "Execute only the scheduled prompt.",
+            "files": [
+                {
+                    "scope": "workspace",
+                    "path": f"scheduled-prompt/{run_id}.md",
+                    "content": "Synthetic scheduled prompt.",
+                }
+            ],
+        },
+        "start_synchronously": False,
+    }
+    return payload
+
+
+def test_scheduled_workbench_persists_default_claude_effort_and_derives_callback_owner(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-token")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "synthetic-callback-secret"
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_ALLOWED_WORKER_PROFILES",
+        "codex-cli,claude-code,openclaw-general",
+    )
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "default")
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+
+    class ScheduledRouteRuntime(StubRuntime):
+        def resolve_model(self, profile: str, execution_mode="docker") -> str:
+            return f"stub/{profile}"
+
+    db_path = tmp_path / "runtime.db"
+    app = create_app(
+        str(db_path), runtime_backend="stub", runtime=ScheduledRouteRuntime()
+    )
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer synthetic-service-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Scheduled prompts",
+            "goal": "Preserve exact fallback and callback identity.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    run_id = "scheduled-run-default-effort"
+    response = client.post(
+        f"/v1/projects/{project['project_id']}/workers/find-or-resume",
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id=run_id,
+            fallback={
+                "worker_profile": "claude-code",
+                "model": "stub/claude-code",
+                "reasoning_effort": "default",
+            },
+        ),
+    )
+
+    assert response.status_code == 200
+    store = Store(str(db_path))
+    worker = store.get_worker(response.json()["worker_id"])
+    bundle = json.loads(worker["bootstrap_bundle_json"])
+    assert bundle["env"] == {
+        "WPR_CODEX_CLI_REASONING_EFFORT": "xhigh",
+        "WPR_CLAUDE_CODE_EFFORT": "default",
+    }
+    assert bundle["callbacks"] == {
+        "events_webhook_url": (
+            "http://127.0.0.1:7010/internal/scheduled-prompts/"
+            "glasshive-callback"
+        ),
+        "hmac_secret": "synthetic-callback-secret",
+        "origin_ref": run_id,
+    }
+    assert "glasshive_capability_authorization" not in bundle
+    assert "GLASSHIVE_CAPABILITY_BROKER_TOKEN" not in str(bundle)
+    resolved = app.state.service._callback_config_for(worker)
+    assert resolved == {
+        **bundle["callbacks"],
+        "user_id": "synthetic-owner",
+        "message_id": run_id,
+        "scheduled_prompt_run_id": run_id,
+        "surface": "workbench",
+    }
+
+
+def test_scheduled_workbench_service_bearer_cannot_replace_callback_secret(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-token")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "canonical-synthetic-secret"
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code"
+    )
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+    broker_calls: list[str] = []
+
+    def forbidden_prepare(url, **_kwargs):
+        broker_calls.append(url)
+        raise AssertionError("Rejected callback authority must not reach Core prepare")
+
+    monkeypatch.setattr(
+        "workers_projects_runtime.broker_admission.httpx.post", forbidden_prepare
+    )
+    db_path = tmp_path / "runtime.db"
+
+    class ScheduledRouteRuntime(StubRuntime):
+        def resolve_model(self, profile: str, execution_mode="docker") -> str:
+            return f"stub/{profile}"
+
+    client = TestClient(
+        create_app(
+            str(db_path), runtime_backend="stub", runtime=ScheduledRouteRuntime()
+        )
+    )
+    headers = {"Authorization": "Bearer synthetic-service-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Scheduled prompts",
+            "goal": "Reject caller-replaced callback authority.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    payload = _scheduled_workbench_worker_payload(
+        run_id="scheduled-run-wrong-callback-secret"
+    )
+    payload["bootstrap_bundle"]["callbacks"]["hmac_secret"] = (
+        "caller-replaced-secret"
+    )
+
+    response = client.post(
+        f"/v1/projects/{project['project_id']}/workers/find-or-resume",
+        headers=headers,
+        json=payload,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "parallel_execution_isolation_required"
+    )
+    assert Store(str(db_path)).list_workers(project["project_id"]) == []
+    assert broker_calls == []
+
+
+def test_scheduled_workbench_callback_config_derives_owner_from_persisted_worker(
+    tmp_path,
+):
+    run_id = "scheduled-run-callback-owner"
+    store = Store(str(tmp_path / "runtime.db"))
+    service = WorkersProjectsService(store, StubRuntime(), reconcile_on_startup=False)
+    project = service.create_project(
+        "synthetic-owner",
+        "Scheduled callback identity",
+        "Return terminal state to the exact owner.",
+        "codex-cli",
+    )
+    try:
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="synthetic-owner",
+            name="Scheduled callback worker",
+            role="scheduled prompt worker",
+            profile="codex-cli",
+            backend="codex-cli",
+            execution_mode="docker",
+            bootstrap_profile="clean-room",
+            bootstrap_bundle={
+                "execution_policy": "parallel-clean-room-v1",
+                "viventium_launch_authority": {
+                    "version": 1,
+                    "kind": "prompt_workbench_scheduled",
+                    "execution_mode": "docker",
+                },
+                "callbacks": {
+                    "events_webhook_url": (
+                        "http://127.0.0.1:7010/internal/scheduled-prompts/"
+                        "glasshive-callback"
+                    ),
+                    "hmac_secret": "synthetic-callback-secret",
+                    "origin_ref": run_id,
+                },
+            },
+            start_synchronously=False,
+        )
+        persisted = store.get_worker(worker["worker_id"])
+
+        assert service._callback_config_for(persisted) == {
+            "events_webhook_url": (
+                "http://127.0.0.1:7010/internal/scheduled-prompts/"
+                "glasshive-callback"
+            ),
+            "hmac_secret": "synthetic-callback-secret",
+            "origin_ref": run_id,
+            "user_id": "synthetic-owner",
+            "message_id": run_id,
+            "scheduled_prompt_run_id": run_id,
+            "surface": "workbench",
+        }
+    finally:
+        service.shutdown()
+
+
+def test_scheduled_workbench_fallback_authority_is_server_constructed_and_replaced(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-token")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "synthetic-callback-secret"
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_ALLOWED_WORKER_PROFILES",
+        "codex-cli,claude-code,openclaw-general",
+    )
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+    db_path = tmp_path / "runtime.db"
+
+    class MutableRouteRuntime(StubRuntime):
+        fallback_model = "stub/claude-code"
+
+        def resolve_model(self, profile: str) -> str:
+            if profile == "claude-code":
+                return self.fallback_model
+            return super().resolve_model(profile)
+
+    runtime = MutableRouteRuntime()
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer synthetic-service-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Scheduled prompts",
+            "goal": "Execute isolated scheduled prompts.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    endpoint = f"/v1/projects/{project['project_id']}/workers/find-or-resume"
+
+    legacy = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "name": "Legacy health context",
+            "role": "Legacy worker",
+            "profile": "codex-cli",
+            "execution_mode": "docker",
+            "alias": "health-context",
+            "start_synchronously": False,
+        },
+    )
+    assert legacy.status_code == 201
+
+    first = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(run_id="scheduled-run-1"),
+    )
+    assert first.status_code == 200
+    worker_id = first.json()["worker_id"]
+    assert worker_id != legacy.json()["worker_id"]
+    assert first.json()["alias"].startswith(
+        "health-context--prompt-workbench-scheduled-"
+    )
+    store = Store(str(db_path))
+    first_worker = store.get_worker(worker_id)
+    first_bundle = json.loads(first_worker["bootstrap_bundle_json"])
+    assert first_worker["bootstrap_profile"] == "clean-room"
+    assert first_bundle["execution_policy"] == "parallel-clean-room-v1"
+    assert first_bundle["viventium_launch_authority"] == {
+        "version": 1,
+        "kind": "prompt_workbench_scheduled",
+        "execution_mode": "docker",
+        "fallback_worker_profile": "claude-code",
+    }
+    assert first_bundle["callbacks"] == {
+        "events_webhook_url": (
+            "http://127.0.0.1:7010/internal/scheduled-prompts/glasshive-callback"
+        ),
+        "hmac_secret": "synthetic-callback-secret",
+        "origin_ref": "scheduled-run-1",
+    }
+    assert first_bundle["env"] == {
+        "WPR_CODEX_CLI_REASONING_EFFORT": "xhigh",
+        "WPR_CLAUDE_CODE_EFFORT": "max",
+    }
+    assert "viventium_execution_authority_request" not in first_bundle
+    assert "glasshive_capability_broker" not in first_bundle
+    resolved_callbacks = app.state.service._callback_config_for(first_worker)
+    assert resolved_callbacks["message_id"] == "scheduled-run-1"
+    assert resolved_callbacks["scheduled_prompt_run_id"] == "scheduled-run-1"
+    assert resolved_callbacks["surface"] == "workbench"
+
+    same = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id="scheduled-run-2",
+        ),
+    )
+    assert same.status_code == 200
+    assert same.json()["worker_id"] == worker_id
+    same_bundle = json.loads(store.get_worker(worker_id)["bootstrap_bundle_json"])
+    assert same_bundle["callbacks"]["origin_ref"] == "scheduled-run-2"
+    assert {entry["path"] for entry in same_bundle["files"]} == {
+        "scheduled-prompt/scheduled-run-2.md"
+    }
+
+    runtime.fallback_model = "stub/claude-code-v2"
+    changed = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id="scheduled-run-3",
+            fallback={
+                "worker_profile": "claude-code",
+                "model": "stub/claude-code-v2",
+                "reasoning_effort": "max",
+            },
+        ),
+    )
+    assert changed.status_code == 200
+    assert changed.json()["worker_id"] != worker_id
+    assert changed.json()["alias"] != first.json()["alias"]
+
+    monkeypatch.delenv("GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE")
+    removed = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id="scheduled-run-4",
+            fallback={},
+        ),
+    )
+    assert removed.status_code == 200
+    assert removed.json()["worker_id"] not in {
+        worker_id,
+        changed.json()["worker_id"],
+    }
+    removed_bundle = json.loads(
+        store.get_worker(removed.json()["worker_id"])["bootstrap_bundle_json"]
+    )
+    assert "fallback_worker_profile" not in removed_bundle[
+        "viventium_launch_authority"
+    ]
+    assert removed_bundle["callbacks"]["origin_ref"] == "scheduled-run-4"
+    assert {entry["path"] for entry in removed_bundle["files"]} == {
+        "scheduled-prompt/scheduled-run-4.md"
+    }
+
+    tampered_bundle = dict(same_bundle)
+    tampered_bundle["viventium_launch_authority"] = {
+        "version": 1,
+        "kind": "prompt_workbench_scheduled",
+        "execution_mode": "docker",
+    }
+    store.update_worker(
+        worker_id,
+        bootstrap_bundle_json=json.dumps(tampered_bundle),
+    )
+    runtime.fallback_model = "stub/claude-code"
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+    mismatch = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(run_id="scheduled-run-5"),
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"]["code"] == (
+        "scheduled_authority_fingerprint_mismatch"
+    )
+
+
+def test_scheduled_workbench_reuses_only_terminal_exact_fallback_and_restores_primary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-token")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "synthetic-callback-secret"
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code"
+    )
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+
+    class ScheduledRouteRuntime(StubRuntime):
+        def resolve_model(self, profile: str, execution_mode="docker") -> str:
+            return f"stub/{profile}"
+
+    db_path = tmp_path / "runtime.db"
+    app = create_app(
+        str(db_path), runtime_backend="stub", runtime=ScheduledRouteRuntime()
+    )
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer synthetic-service-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Scheduled fallback reuse",
+            "goal": "Reuse only an exact terminal fallback route.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    endpoint = f"/v1/projects/{project['project_id']}/workers/find-or-resume"
+    first_payload = _scheduled_workbench_worker_payload(
+        run_id="scheduled-terminal-fallback-1"
+    )
+    first = client.post(endpoint, headers=headers, json=first_payload)
+    assert first.status_code == 200
+    worker_id = first.json()["worker_id"]
+    store = Store(str(db_path))
+    service = app.state.service
+    fallback_fields = {
+        "profile": "claude-code",
+        "backend": service._legacy_backend_label("claude-code", "docker", ""),
+        "runtime": service._initial_runtime_label("claude-code", "docker"),
+        "model": "stub/claude-code",
+    }
+    store.update_worker(worker_id, **fallback_fields)
+    store.create_run(
+        worker_id,
+        project["project_id"],
+        "Synthetic terminal fallback attempt.",
+        state="failed",
+    )
+
+    resumed = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id="scheduled-terminal-fallback-2"
+        ),
+    )
+
+    assert resumed.status_code == 200
+    assert resumed.json()["worker_id"] == worker_id
+    restored = store.get_worker(worker_id)
+    assert {
+        key: restored[key] for key in ("profile", "backend", "runtime", "model")
+    } == {
+        "profile": "codex-cli",
+        "backend": service._legacy_backend_label(
+            "codex-cli", "docker", "codex-cli"
+        ),
+        "runtime": service._initial_runtime_label("codex-cli", "docker"),
+        "model": "stub/codex-cli",
+    }
+    restored_bundle = json.loads(restored["bootstrap_bundle_json"])
+    assert restored_bundle["callbacks"]["origin_ref"] == (
+        "scheduled-terminal-fallback-2"
+    )
+
+    store.update_worker(worker_id, **fallback_fields)
+    store.create_run(
+        worker_id,
+        project["project_id"],
+        "Synthetic still-queued fallback attempt.",
+        state="queued",
+    )
+    active_fallback = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id="scheduled-terminal-fallback-3"
+        ),
+    )
+    assert active_fallback.status_code == 409
+    assert active_fallback.json()["detail"]["code"] == (
+        "scheduled_authority_fingerprint_mismatch"
+    )
+    assert store.get_worker(worker_id)["profile"] == "claude-code"
+
+    arbitrary_payload = _scheduled_workbench_worker_payload(
+        run_id="scheduled-arbitrary-route-1", alias="arbitrary-route"
+    )
+    arbitrary = client.post(endpoint, headers=headers, json=arbitrary_payload)
+    assert arbitrary.status_code == 200
+    arbitrary_worker_id = arbitrary.json()["worker_id"]
+    store.update_worker(
+        arbitrary_worker_id,
+        **{**fallback_fields, "model": "stub/not-the-declared-fallback"},
+    )
+    store.create_run(
+        arbitrary_worker_id,
+        project["project_id"],
+        "Synthetic terminal arbitrary route.",
+        state="failed",
+    )
+    arbitrary_reuse = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id="scheduled-arbitrary-route-2", alias="arbitrary-route"
+        ),
+    )
+    assert arbitrary_reuse.status_code == 409
+    assert arbitrary_reuse.json()["detail"]["code"] == (
+        "scheduled_authority_fingerprint_mismatch"
+    )
+
+
+def test_scheduled_workbench_reconciles_only_legacy_missing_claude_default(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-token")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "synthetic-callback-secret"
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_ALLOWED_WORKER_PROFILES", "codex-cli,claude-code"
+    )
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "default")
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+
+    class ScheduledRouteRuntime(StubRuntime):
+        def resolve_model(self, profile: str, execution_mode="docker") -> str:
+            return f"stub/{profile}"
+
+    db_path = tmp_path / "runtime.db"
+    app = create_app(
+        str(db_path), runtime_backend="stub", runtime=ScheduledRouteRuntime()
+    )
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer synthetic-service-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Legacy scheduled fallback envelope",
+            "goal": "Reconcile only the known legacy default omission.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    endpoint = f"/v1/projects/{project['project_id']}/workers/find-or-resume"
+    store = Store(str(db_path))
+    service = app.state.service
+    fallback_fields = {
+        "profile": "claude-code",
+        "backend": service._legacy_backend_label("claude-code", "docker", ""),
+        "runtime": service._initial_runtime_label("claude-code", "docker"),
+        "model": "stub/claude-code",
+    }
+
+    def create_exact(alias: str, run_id: str) -> tuple[str, dict]:
+        response = client.post(
+            endpoint,
+            headers=headers,
+            json=_scheduled_workbench_worker_payload(
+                run_id=run_id,
+                alias=alias,
+                fallback={
+                    "worker_profile": "claude-code",
+                    "model": "stub/claude-code",
+                    "reasoning_effort": "default",
+                },
+            ),
+        )
+        assert response.status_code == 200
+        worker_id = response.json()["worker_id"]
+        bundle = json.loads(store.get_worker(worker_id)["bootstrap_bundle_json"])
+        assert bundle["env"] == {
+            "WPR_CODEX_CLI_REASONING_EFFORT": "xhigh",
+            "WPR_CLAUDE_CODE_EFFORT": "default",
+        }
+        return worker_id, bundle
+
+    worker_id, exact_bundle = create_exact(
+        "legacy-default", "legacy-default-run-1"
+    )
+    legacy_bundle = json.loads(json.dumps(exact_bundle))
+    legacy_bundle["env"].pop("WPR_CLAUDE_CODE_EFFORT")
+    store.update_worker(
+        worker_id,
+        **fallback_fields,
+        bootstrap_bundle_json=json.dumps(legacy_bundle),
+    )
+    store.create_run(
+        worker_id,
+        project["project_id"],
+        "Synthetic terminal legacy fallback.",
+        state="failed",
+    )
+
+    reconciled = client.post(
+        endpoint,
+        headers=headers,
+        json=_scheduled_workbench_worker_payload(
+            run_id="legacy-default-run-2",
+            alias="legacy-default",
+            fallback={
+                "worker_profile": "claude-code",
+                "model": "stub/claude-code",
+                "reasoning_effort": "default",
+            },
+        ),
+    )
+
+    assert reconciled.status_code == 200
+    assert reconciled.json()["worker_id"] == worker_id
+    restored = store.get_worker(worker_id)
+    restored_bundle = json.loads(restored["bootstrap_bundle_json"])
+    assert restored["profile"] == "codex-cli"
+    assert restored["model"] == "stub/codex-cli"
+    assert restored_bundle["env"] == {
+        "WPR_CODEX_CLI_REASONING_EFFORT": "xhigh",
+        "WPR_CLAUDE_CODE_EFFORT": "default",
+    }
+    assert restored_bundle["callbacks"]["origin_ref"] == "legacy-default-run-2"
+
+    rejected_cases = (
+        ("missing-primary", "missing_primary", "failed"),
+        ("mismatched-default", "mismatched_default", "failed"),
+        ("active-legacy", "legacy_default", "queued"),
+    )
+    for alias, mutation, run_state in rejected_cases:
+        candidate_id, candidate_bundle = create_exact(alias, f"{alias}-run-1")
+        if mutation == "missing_primary":
+            candidate_bundle["env"].pop("WPR_CODEX_CLI_REASONING_EFFORT")
+        elif mutation == "mismatched_default":
+            candidate_bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] = "max"
+        else:
+            candidate_bundle["env"].pop("WPR_CLAUDE_CODE_EFFORT")
+        store.update_worker(
+            candidate_id,
+            **fallback_fields,
+            bootstrap_bundle_json=json.dumps(candidate_bundle),
+        )
+        store.create_run(
+            candidate_id,
+            project["project_id"],
+            f"Synthetic {mutation} fallback state.",
+            state=run_state,
+        )
+        rejected = client.post(
+            endpoint,
+            headers=headers,
+            json=_scheduled_workbench_worker_payload(
+                run_id=f"{alias}-run-2",
+                alias=alias,
+                fallback={
+                    "worker_profile": "claude-code",
+                    "model": "stub/claude-code",
+                    "reasoning_effort": "default",
+                },
+            ),
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["detail"]["code"] == (
+            "scheduled_authority_fingerprint_mismatch"
+        )
+
+
+def test_scheduled_workbench_fallback_authority_request_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-token")
+    monkeypatch.setenv(
+        "VIVENTIUM_GLASSHIVE_CALLBACK_SECRET", "synthetic-callback-secret"
+    )
+    monkeypatch.setenv(
+        "GLASSHIVE_ALLOWED_WORKER_PROFILES",
+        "codex-cli,claude-code,openclaw-general",
+    )
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+    client = TestClient(
+        create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
+    )
+    headers = {"Authorization": "Bearer synthetic-service-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Scheduled prompts",
+            "goal": "Reject unsafe authority requests.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    base = _scheduled_workbench_worker_payload(run_id="scheduled-run-rejected")
+    endpoint = f"/v1/projects/{project['project_id']}/workers/find-or-resume"
+    rejected_payloads = []
+    rejected_payloads.append({**base, "bootstrap_profile": "clean-room"})
+    rejected_payloads.append({**base, "execution_mode": "host"})
+    same_fallback = json.loads(json.dumps(base))
+    same_fallback["bootstrap_bundle"]["viventium_execution_authority_request"][
+        "fallback"
+    ] = {
+        "worker_profile": "codex-cli",
+        "model": "stub/codex-cli",
+        "reasoning_effort": "xhigh",
+    }
+    rejected_payloads.append(same_fallback)
+    disallowed_fallback = json.loads(json.dumps(base))
+    disallowed_fallback["bootstrap_bundle"][
+        "viventium_execution_authority_request"
+    ]["fallback"] = {
+        "worker_profile": "openclaw-general",
+        "model": "stub/general",
+        "reasoning_effort": "default",
+    }
+    rejected_payloads.append(disallowed_fallback)
+    wrong_fallback_model = json.loads(json.dumps(base))
+    wrong_fallback_model["bootstrap_bundle"][
+        "viventium_execution_authority_request"
+    ]["fallback"]["model"] = "stub/not-the-compiled-route"
+    rejected_payloads.append(wrong_fallback_model)
+    wrong_fallback_effort = json.loads(json.dumps(base))
+    wrong_fallback_effort["bootstrap_bundle"][
+        "viventium_execution_authority_request"
+    ]["fallback"]["reasoning_effort"] = "default"
+    rejected_payloads.append(wrong_fallback_effort)
+    forged_policy = json.loads(json.dumps(base))
+    forged_policy["bootstrap_bundle"]["execution_policy"] = "parallel-clean-room-v1"
+    rejected_payloads.append(forged_policy)
+    forged_authority = json.loads(json.dumps(base))
+    forged_authority["bootstrap_bundle"]["viventium_launch_authority"] = {
+        "version": 1,
+        "kind": "prompt_workbench_scheduled",
+        "execution_mode": "docker",
+        "fallback_worker_profile": "claude-code",
+    }
+    rejected_payloads.append(forged_authority)
+
+    for index, payload in enumerate(rejected_payloads):
+        payload["alias"] = f"rejected-{index}"
+        response = client.post(endpoint, headers=headers, json=payload)
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == (
+            "parallel_execution_isolation_required"
+        )
+
+    monkeypatch.delenv("GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE")
+    missing_config = client.post(
+        endpoint,
+        headers=headers,
+        json={**base, "alias": "missing-configured-fallback"},
+    )
+    assert missing_config.status_code == 409
+    assert missing_config.json()["detail"]["code"] == (
+        "parallel_execution_isolation_required"
+    )
+
+    generic_create = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        headers=headers,
+        json=base,
+    )
+    assert generic_create.status_code == 409
+
+
+def test_scheduled_workbench_authority_requires_service_authentication(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    client = TestClient(
+        create_app(str(tmp_path / "runtime.db"), runtime_backend="stub", runtime=StubRuntime())
+    )
+    project = client.post(
+        "/v1/projects",
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Local caller",
+            "goal": "Prove local callers cannot mint scheduled authority.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    response = client.post(
+        f"/v1/projects/{project['project_id']}/workers/find-or-resume",
+        json=_scheduled_workbench_worker_payload(run_id="scheduled-local-rejected"),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "parallel_execution_isolation_required"
+    )
+
+
+def test_scheduled_workbench_authority_rejects_service_identity(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WPR_API_TOKEN", "synthetic-service-token")
+    monkeypatch.setenv("WPR_CODEX_CLI_REASONING_EFFORT", "xhigh")
+    monkeypatch.setenv("WPR_CLAUDE_CODE_EFFORT", "max")
+    monkeypatch.setenv(
+        "GLASSHIVE_DEFAULT_FALLBACK_WORKER_PROFILE", "claude-code"
+    )
+    client = TestClient(
+        create_app(
+            str(tmp_path / "runtime.db"),
+            runtime_backend="stub",
+            runtime=StubRuntime(),
+        )
+    )
+    service_headers = {"Authorization": "Bearer synthetic-service-token"}
+    project = client.post(
+        "/v1/projects",
+        headers=service_headers,
+        json={
+            "owner_id": "synthetic-owner",
+            "title": "Scoped service caller",
+            "goal": "Prove identity-scoped callers cannot mint scheduled authority.",
+            "default_worker_profile": "codex-cli",
+        },
+    ).json()
+    response = client.post(
+        f"/v1/projects/{project['project_id']}/workers/find-or-resume",
+        headers={
+            **service_headers,
+            "X-Viventium-User-Id": "synthetic-owner",
+        },
+        json=_scheduled_workbench_worker_payload(
+            run_id="scheduled-service-identity-rejected"
+        ),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "parallel_execution_isolation_required"
+    )
 
 
 def test_worker_find_or_resume_refreshes_runtime_when_alias_reprofiles(tmp_path):
@@ -6471,7 +8636,9 @@ def test_signed_worker_view_is_limited_to_read_and_narrow_communication(tmp_path
     monkeypatch.setenv("WPR_API_TOKEN", "api-token")
 
     db_path = tmp_path / "runtime.db"
-    client = TestClient(create_app(str(db_path), runtime_backend="stub"))
+    app = create_app(str(db_path), runtime_backend="stub")
+    app.state.service._ensure_worker_processor = lambda _worker_id: None
+    client = TestClient(app)
     headers = {"x-wpr-token": "api-token"}
     project = client.post(
         "/v1/projects",
@@ -7721,7 +9888,7 @@ def test_pause_resume_freezes_active_run_without_losing_it(tmp_path):
     assert paused.json()["state"] == "paused"
 
     run_during_pause = client.get(f"/v1/runs/{run['run_id']}").json()
-    assert run_during_pause["state"] == "running"
+    assert run_during_pause["state"] == "paused"
 
     resumed = client.post(f"/v1/workers/{worker['worker_id']}/resume")
     assert resumed.status_code == 202
@@ -7731,6 +9898,192 @@ def test_pause_resume_freezes_active_run_without_losing_it(tmp_path):
     settled = wait_for_run(client, run["run_id"], timeout=3.0)
     assert settled["state"] == "completed"
     assert settled["output_text"] == "CONTROLLABLE_OK"
+
+
+class CompletionDuringPauseRuntime(ControllableRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.store: Store | None = None
+        self.run_id = ""
+
+    def pause_worker(self, worker: dict) -> RuntimeInfo:
+        assert self.store is not None
+        assert self.store.finalize_run_if_state(
+            self.run_id,
+            "running",
+            "completed",
+            output_text="COMPLETED_DURING_PAUSE",
+            **exact_terminal_generation(self.store, self.run_id),
+        )
+        return super().pause_worker(worker)
+
+
+def test_completion_wins_pause_race_and_worker_does_not_regress_to_paused(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = CompletionDuringPauseRuntime()
+    client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=runtime))
+    runtime.store = client.app.state.store
+
+    project = client.post(
+        "/v1/projects",
+        json={"owner_id": "demo-owner", "title": "Pause race", "goal": "Keep terminal truth."},
+    ).json()
+    worker = client.post(
+        f"/v1/projects/{project['project_id']}/workers",
+        json={"owner_id": "demo-owner", "name": "Pause Race Worker", "role": "coder"},
+    ).json()
+    run = client.post(
+        f"/v1/workers/{worker['worker_id']}/assign",
+        json={"instruction": "Complete while pause is being accepted."},
+    ).json()
+    runtime.run_id = run["run_id"]
+    assert runtime.running.wait(timeout=2), "worker run never started"
+
+    paused = client.post(f"/v1/workers/{worker['worker_id']}/pause")
+
+    assert paused.status_code == 202
+    assert client.get(f"/v1/runs/{run['run_id']}").json()["state"] == "completed"
+    assert client.get(f"/v1/workers/{worker['worker_id']}").json()["state"] == "ready"
+
+
+class RestartingHostPauseRuntime:
+    requires_run_start_identity = True
+
+    def __init__(self) -> None:
+        self.first_started = Event()
+        self.pause_requested = Event()
+        self.invocations = 0
+        self._run_start_observer = None
+
+    def set_run_start_observer(self, observer) -> None:
+        self._run_start_observer = observer
+
+    def resolve_model(self, profile: str) -> str:
+        return "host-pause-restart/test"
+
+    def _info(self, worker: dict, pid: int | None = None) -> RuntimeInfo:
+        return RuntimeInfo(
+            runtime="host-pause-restart",
+            model=worker.get("model") or self.resolve_model(worker.get("profile", "")),
+            gateway_url="",
+            gateway_port=None,
+            gateway_token=None,
+            session_key=f"host-pause-restart:{worker['worker_id']}",
+            state_dir=f"/tmp/{worker['worker_id']}/state",
+            workspace_dir=f"/tmp/{worker['worker_id']}/workspace",
+            pid=pid,
+        )
+
+    def ensure_worker_ready(self, worker: dict) -> RuntimeInfo:
+        self.pause_requested.clear()
+        return self._info(worker)
+
+    def pause_worker(self, worker: dict) -> RuntimeInfo:
+        self.pause_requested.set()
+        return self._info(worker)
+
+    def interrupt_worker(self, worker: dict, run_id: str | None = None) -> RuntimeInfo:
+        self.pause_requested.set()
+        return self._info(worker)
+
+    def terminate_worker(self, worker: dict) -> RuntimeInfo:
+        self.pause_requested.set()
+        return self._info(worker)
+
+    def reconcile_worker(self, worker: dict) -> RuntimeInfo:
+        return self._info(worker)
+
+    def run_task(
+        self,
+        worker: dict,
+        instruction: str,
+        timeout_sec: float | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        self.invocations += 1
+        pid = 4241 + self.invocations
+        assert self._run_start_observer is not None
+        self._run_start_observer(
+            {
+                "worker_id": worker["worker_id"],
+                "run_id": run_id,
+                "identity_kind": "host_process",
+                "pid": pid,
+                "process_group": pid,
+                "process_start_identity": f"ps-lstart:synthetic-host-{self.invocations}",
+                "container_id": "",
+                "session_id": f"synthetic-host-session-{self.invocations}",
+            }
+        )
+        if self.invocations == 1:
+            self.first_started.set()
+            assert self.pause_requested.wait(timeout=3)
+            raise WorkerPausedError("Host provider stopped for durable pause")
+        return "HOST_RESUMED_SAME_RUN_OK"
+
+
+def test_host_pause_resume_restarts_provider_on_the_same_durable_run(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GLASSHIVE_HOST_WORKERS_ENABLED", "true")
+    store = Store(str(tmp_path / "runtime.db"))
+    runtime = RestartingHostPauseRuntime()
+    service = WorkersProjectsService(store, runtime, reconcile_on_startup=False)
+    try:
+        project = service.create_project(
+            "demo-owner", "Host pause resume", "Resume the exact host mission.", "codex-cli"
+        )
+        worker = service.create_worker(
+            project_id=project["project_id"],
+            owner_id="demo-owner",
+            name="Host Pause Worker",
+            role="coder",
+            profile="codex-cli",
+            backend="codex-cli",
+            execution_mode="host",
+        )
+        run = service.assign_run(worker["worker_id"], "Continue after a host pause.")
+        assert runtime.first_started.wait(timeout=2)
+        first_running = store.get_run(run["run_id"])
+        assert first_running and first_running["state"] == "running"
+        first_attempt_id = str(first_running["active_attempt_id"])
+        first_attempt = store.get_run_attempt(first_attempt_id)
+        first_lease = store.get_active_host_run_lease_for_run(run["run_id"])
+        assert first_attempt and first_attempt["state"] == "running"
+        assert first_lease and first_lease["attempt_id"] == first_attempt_id
+
+        service.pause_worker(worker["worker_id"])
+        wait_until(lambda: not service._local_processor_owns(worker["worker_id"]))
+        assert store.get_run(run["run_id"])["state"] == "paused"
+        paused_lease = store.get_host_run_lease(first_lease["lease_id"])
+        assert paused_lease and paused_lease["status"] == "released"
+
+        service.resume_worker(worker["worker_id"])
+        wait_until(
+            lambda: (store.get_run(run["run_id"]) or {}).get("state") == "completed",
+            timeout=3,
+        )
+
+        durable = store.get_run(run["run_id"])
+        assert durable["output_text"] == "HOST_RESUMED_SAME_RUN_OK"
+        assert runtime.invocations == 2
+        assert [item["run_id"] for item in store.list_runs_for_worker(worker["worker_id"])] == [
+            run["run_id"]
+        ]
+        attempts = store.list_run_attempts(run["run_id"])
+        assert len(attempts) == 2
+        assert attempts[0]["attempt_id"] == first_attempt_id
+        assert attempts[0]["state"] == "retry_queued"
+        assert attempts[0]["ended_at"]
+        assert attempts[0]["terminal_reason"] == "host_pause_resume_restart"
+        assert attempts[1]["attempt_number"] == attempts[0]["attempt_number"] + 1
+        assert attempts[1]["state"] == "completed"
+        assert durable["active_attempt_id"] == attempts[1]["attempt_id"]
+        renewed_lease = store.get_host_run_lease(first_lease["lease_id"])
+        assert renewed_lease
+        assert renewed_lease["startup_token"] != first_lease["startup_token"]
+    finally:
+        service.shutdown()
 
 
 class RaisingPauseRuntime:
@@ -7825,7 +10178,7 @@ def test_worker_paused_error_finalizes_run_as_paused(tmp_path):
 
     assert settled is not None, "run did not settle into paused state"
     assert settled["state"] == "paused"
-    assert "paused while a run was active" in settled["error_text"]
+    assert settled["error_text"] == "Paused by operator"
 
 
 def test_interrupt_stops_active_run_and_keeps_worker_ready(tmp_path):
@@ -9461,6 +11814,15 @@ def test_control_action_losing_race_to_close_has_no_stale_side_effects(
         backend="openclaw",
         start_synchronously=False,
     )
+    # This case exercises a live idle-compute control racing permanent close.
+    # A newly created asynchronous workspace is durably paused until admitted,
+    # so establish the ready/live precondition explicitly.
+    if operation == "pause":
+        worker = store.update_worker(
+            worker["worker_id"],
+            state="ready",
+            compute_released_at=None,
+        )
     active_run = None
     if operation == "interrupt":
         queued_run = service.assign_run(
@@ -10096,6 +12458,22 @@ class RuntimeIoFailureWithDeliverableArtifactRuntime(RuntimeErrorWithDeliverable
         }
 
 
+class ProviderAuthNeedsInputRecoveryRuntime(RuntimeErrorWithPartialArtifactsRuntime):
+    def collect_completed_run(self, worker: dict, run_id: str | None = None) -> dict[str, object] | None:
+        self.collect_run_ids.append(run_id)
+        return {
+            "state": "needs_input",
+            "output_text": "",
+            "error_text": "The connected model account is unavailable for this mission.",
+            "failure_class": "provider_auth_projection_unavailable",
+            "failure_retryable": 0,
+            "failure_structured": 1,
+            "failure_user_message": "The connected model account is unavailable for this mission.",
+            "failure_recommended_recovery": "Connect or reauthorize the model account, then resume this work.",
+            "failure_diagnostic_summary": "The clean-room provider broker returned needs-input truth.",
+        }
+
+
 class EvidenceFailureWithCompletedRecoveryRuntime(RuntimeErrorWithDeliverableArtifactRuntime):
     def run_task(self, worker: dict, instruction: str, timeout_sec: float | None = None, run_id: str | None = None) -> str:
         publish_in_process_test_start(worker)
@@ -10420,7 +12798,9 @@ def test_worker_terminated_error_recovers_completed_artifacts(tmp_path):
                 break
             time.sleep(0.05)
         else:
-            raise AssertionError("Run did not recover completed artifacts")
+            raise AssertionError(
+                "Run did not recover completed artifacts and settle its worker"
+            )
 
         assert store.get_run(run["run_id"])["output_text"] == "Recovered final answer"
         assert store.get_worker(worker["worker_id"])["state"] == "ready"
@@ -11165,6 +13545,33 @@ def test_artifact_open_page_previews_text_without_forcing_download(tmp_path, mon
         assert client.get(f"/v1/signed-links/{tampered_payload}.{signature}").status_code == 401
 
 
+def test_artifact_listing_reports_truncation_even_when_directories_consume_the_cap(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    runtime = DeliverableDesktopRuntime(tmp_path / "desktop")
+    app = create_app(str(db_path), runtime_backend="stub", runtime=runtime)
+
+    with TestClient(app) as client:
+        project = client.post(
+            "/v1/projects",
+            json={"owner_id": "demo-owner", "title": "Artifact Cap", "goal": "List safely."},
+        ).json()
+        worker = client.post(
+            f"/v1/projects/{project['project_id']}/workers",
+            json={"owner_id": "demo-owner", "name": "Cap Worker", "role": "writer", "profile": "codex-cli"},
+        ).json()
+        reports = Path(worker["workspace_dir"]) / "reports"
+        reports.mkdir()
+        for index in range(501):
+            (reports / f"item-{index:03d}.txt").write_text("synthetic", encoding="utf-8")
+
+        listed = client.get(f"/v1/workers/{worker['worker_id']}/artifacts")
+
+        assert listed.status_code == 200
+        payload = listed.json()
+        assert payload["truncated"] is True
+        assert len(payload["items"]) == 499
+
+
 def test_enterprise_signed_artifact_open_page_actions_remain_signed(tmp_path, monkeypatch):
     monkeypatch.setenv("WPR_API_TOKEN", "service-token")
     monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", "signed-link-secret")
@@ -11521,7 +13928,11 @@ def test_finalize_schedule_does_not_downgrade_terminal_state(tmp_path):
     assert refreshed["queued_run_id"] == "run_done"
 
 
-def test_native_schedule_queues_due_run(tmp_path):
+def test_native_schedule_queues_due_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("WPR_HOST_MIN_AVAILABLE_MEMORY_MB", "0")
+    monkeypatch.setenv("WPR_HOST_MIN_AVAILABLE_DISK_MB", "0")
+    monkeypatch.setenv("WPR_DOCKER_MEMORY_RESERVATION_MB", "1")
+    monkeypatch.setenv("WPR_DOCKER_DISK_RESERVATION_MB", "1")
     db_path = tmp_path / "runtime.db"
     client = TestClient(create_app(str(db_path), runtime_backend="stub", runtime=StubRuntime()))
     project = client.post(

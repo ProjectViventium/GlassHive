@@ -47,6 +47,9 @@ from .signed_links import (
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SAFE_WORKER_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# Runtime opaque refs accept 12-96 characters total; account view refs use the
+# structural ``ghr_`` namespace within that bounded alphabet.
+SAFE_WORK_VIEW_REF_RE = re.compile(r"^ghr_[A-Za-z0-9_-]{8,92}$")
 SAFE_UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 PROVIDER_ACCOUNT_POLICIES = {"legacy", "personal_preferred", "personal_required"}
 PROFILE_ACCOUNT_PROVIDERS = {
@@ -69,7 +72,6 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_PARENT_REVISION",
     "GLASSHIVE_COMPONENT_REVISION",
     "GLASSHIVE_ENTERPRISE_MODE",
-    "GLASSHIVE_SECURITY_MODE",
     "GLASSHIVE_PUBLIC_LINKS_ONLY",
     "WPR_ENTERPRISE_MODE",
     "GLASSHIVE_AUTH_MODE",
@@ -132,7 +134,6 @@ RUNTIME_ENV_KEYS = {
     "GLASSHIVE_LINK_REF_STATE_PATH",
     "GLASSHIVE_LINK_REF_SHARED_GROUP",
     "GLASSHIVE_LINK_REF_TTL_SECONDS",
-    "GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME",
     "WPR_LINK_REF_TTL_SECONDS",
     "GLASSHIVE_WATCH_SESSION_STATE_PATH",
     "GLASSHIVE_MAX_WATCH_SESSION_DURATION_S",
@@ -744,8 +745,8 @@ def _truthy_env(name: str) -> bool:
     return _env_flag(name, False)
 
 
-def _workspace_link_auto_resume_enabled() -> bool:
-    return _env_flag("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", False)
+def _public_links_only_enabled() -> bool:
+    return _truthy_env("GLASSHIVE_PUBLIC_LINKS_ONLY")
 
 
 def _public_links_only_enabled() -> bool:
@@ -768,7 +769,7 @@ def _validate_enterprise_startup() -> None:
     security_mode = str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "").strip().lower()
     if security_mode not in {"", "local", "legacy_compatibility", "multi_user"}:
         raise RuntimeError("GLASSHIVE_SECURITY_MODE must be local, legacy_compatibility, or multi_user")
-    enterprise = _multi_user_security_enabled() or _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
+    enterprise = _truthy_env("GLASSHIVE_ENTERPRISE_MODE") or _truthy_env("WPR_ENTERPRISE_MODE")
     human_auth_mode = str(os.environ.get("GLASSHIVE_HUMAN_AUTH_MODE") or "").strip().lower()
     if human_auth_mode == "oidc" and _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY"):
         raise RuntimeError("OIDC human auth cannot trust inbound identity headers")
@@ -1770,19 +1771,30 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             and str(payload.get("kind") or "") == "worker_view"
             and str(payload.get("worker_id") or "").strip() == str(worker_id or "").strip()
         ):
-            token, payload = _fresh_worker_view_token_from_payload(worker_id, payload)
-            try:
-                cookie_max_age = max(1, min(30 * 60, int(payload.get("exp") or 0) - int(time.time())))
-            except (TypeError, ValueError):
-                cookie_max_age = 30 * 60
-            response.set_cookie(
-                _worker_cookie_name(worker_id),
-                token,
-                max_age=cookie_max_age,
-                httponly=True,
-                samesite="lax",
-                secure=_request_uses_https(request),
+            _set_worker_cookie_from_payload(response, request, worker_id, payload)
+
+    def _set_worker_cookie_from_payload(
+        response: Response,
+        request: Request,
+        worker_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        token, refreshed_payload = _fresh_worker_view_token_from_payload(worker_id, payload)
+        try:
+            cookie_max_age = max(
+                1,
+                min(30 * 60, int(refreshed_payload.get("exp") or 0) - int(time.time())),
             )
+        except (TypeError, ValueError):
+            cookie_max_age = 30 * 60
+        response.set_cookie(
+            _worker_cookie_name(worker_id),
+            token,
+            max_age=cookie_max_age,
+            httponly=True,
+            samesite="lax",
+            secure=_request_uses_https(request),
+        )
 
     def _file_response_with_signed_cookie(request: Request, worker_id: str, path: Path) -> FileResponse:
         response = FileResponse(path)
@@ -1831,6 +1843,51 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         if str(payload.get("kind") or "") == "worker_view" and token_worker_id:
             _ensure_signed_worker_watch_session(token_worker_id, payload)
         return payload
+
+    def _uses_worker_view_credential(
+        request: Request | WebSocket,
+        worker_id: str | None = None,
+    ) -> bool:
+        """Return true when this request's authority is a shareable view token."""
+
+        tokens = [_signed_token_from_request(request, worker_id)]
+        # HTTP middleware runs before route path parameters are populated, so
+        # inspect the worker-scoped cookie namespace directly as well. One
+        # read-only view cookie can never be treated as ambient member auth for
+        # an account-wide or differently shaped mutation route.
+        tokens.extend(
+            str(value or "").strip()
+            for name, value in request.cookies.items()
+            if str(name).startswith("glasshive_gh_token_")
+        )
+        for token in tokens:
+            if not token:
+                continue
+            payload = verify_signed_link_token(token)
+            if isinstance(payload, dict) and str(payload.get("kind") or "") == "worker_view":
+                return True
+        return False
+
+    @app.middleware("http")
+    async def worker_view_is_read_only(request: Request, call_next):
+        # A viewRef is intentionally reusable for bounded observation. It is
+        # never an account/member/action capability—even after the watch page
+        # moves it to an HttpOnly cookie or a browser sends it via Referer.
+        if (
+            request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
+            and _uses_worker_view_credential(request)
+            and not _valid_signed_link_communication_request(request)
+        ):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": (
+                        "This GlassHive workspace link is read-only. Use the authenticated "
+                        "Parallel Work action controls to change or stop work."
+                    )
+                },
+            )
+        return await call_next(request)
 
     def _signed_link_identity(request: Request | WebSocket, worker_id: str | None = None) -> dict[str, str] | None:
         payload = _signed_link_payload(request, worker_id)
@@ -1886,6 +1943,12 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
         session_identity = _session_identity_for_request(request)
         if session_identity is not None:
             return session_identity
+
+        if _public_links_only_enabled():
+            raise HTTPException(
+                status_code=401,
+                detail="This public GlassHive surface requires a signed workspace or artifact link",
+            )
 
         enterprise = _enterprise_mode_enabled()
         trust_inbound_identity = _truthy_env("GLASSHIVE_TRUST_INBOUND_IDENTITY")
@@ -2176,6 +2239,27 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return client
         return client.with_headers(headers)
 
+    def _runtime_headers_for_short_ref_payload(payload: dict[str, object]) -> dict[str, str]:
+        api_token = str(os.environ.get("WPR_API_TOKEN") or "").strip()
+        if not api_token:
+            if _enterprise_mode_enabled():
+                raise HTTPException(
+                    status_code=503,
+                    detail="GlassHive enterprise UI is missing service authentication",
+                )
+            return {}
+        headers = {"X-WPR-Token": api_token}
+        tenant_id = str(payload.get("tenant_id") or "").strip()
+        owner_id = str(payload.get("owner_id") or "").strip()
+        if _enterprise_mode_enabled() and (not tenant_id or not owner_id):
+            raise HTTPException(status_code=401, detail="GlassHive workspace identity is invalid")
+        if tenant_id:
+            headers["X-Viventium-Tenant-Id"] = tenant_id
+        if owner_id:
+            headers["X-Viventium-User-Id"] = owner_id
+        headers["X-Viventium-User-Role"] = "viewer"
+        return headers
+
     def _client_for_short_ref_payload(payload: dict[str, object]) -> RuntimeClient:
         api_token = str(os.environ.get("WPR_API_TOKEN") or "").strip()
         if not api_token or not hasattr(client, "with_headers"):
@@ -2205,21 +2289,43 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             return client.with_headers_factory(scoped_headers)
         return client.with_headers(scoped_headers())
 
+    # VIVENTIUM START: authoritative runtime gate for public worker views
     def _record_workspace_link_open(payload: dict[str, object], worker_id: str) -> None:
+        """Require the runtime's scoped, current worker authorization."""
+
         scoped_client = _client_for_short_ref_payload(payload)
         try:
             scoped_client.record_worker_view_open(worker_id)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 503
+            if status_code not in {401, 403, 404, 410}:
+                status_code = 503
+            raise HTTPException(
+                status_code=status_code,
+                detail="GlassHive workspace link is no longer available",
+            ) from exc
+        except (httpx.HTTPError, OSError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="GlassHive runtime could not authorize this workspace link",
+            ) from exc
         except Exception as exc:
-            logger.warning("Failed to audit GlassHive worker view open for %s: %s", worker_id, exc)
-        if not _workspace_link_auto_resume_enabled():
-            return
-        try:
-            scoped_client.lifecycle(worker_id, "resume")
-        except Exception as exc:
-            logger.warning("Failed to auto-resume GlassHive workspace from short link for %s: %s", worker_id, exc)
+            # Any unexpected client/transport failure is denial, never
+            # permission to fall back to the duplicate ambient verifier.
+            raise HTTPException(
+                status_code=503,
+                detail="GlassHive runtime could not authorize this workspace link",
+            ) from exc
+        # Opening a reusable view capability must never mutate mission state.
+        # Resume belongs to the owner-scoped, idempotent account action plane.
 
     def _require_ui_auth(request: Request, worker_id: str | None = None) -> None:
         _runtime_headers_for_request(request, worker_id)
+        if worker_id:
+            payload = _signed_link_payload(request, worker_id)
+            if isinstance(payload, dict) and str(payload.get("kind") or "") == "worker_view":
+                _record_workspace_link_open(payload, worker_id)
+    # VIVENTIUM END: authoritative runtime gate for public worker views
 
     def _owner_id_for_request(request: Request) -> str:
         identity = _request_identity(request)
@@ -2416,10 +2522,8 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Not found")
         if _public_links_only_enabled() and prefix == "v1" and str(path).startswith("signed-links/"):
             raise HTTPException(status_code=404, detail="GlassHive public links use opaque references")
-        # Mission references carry their own read-only authority, checked by the runtime.
-        # Never attach the operator's service credentials or create a control-session cookie.
-        worker_id = None if prefix == "w" else _worker_id_from_runtime_proxy_path(path, request)
-        auth_headers = {} if prefix == "w" else _runtime_headers_for_request(request, worker_id)
+        worker_id = _worker_id_from_runtime_proxy_path(path, request)
+        auth_headers = _runtime_headers_for_request(request, worker_id)
         upstream_headers = {
             key: value
             for key, value in request.headers.items()
@@ -2455,6 +2559,64 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             _set_signed_worker_cookie(response, request, worker_id)
         return response
 
+    async def _runtime_work_view_proxy(ref_id: str, request: Request) -> Response:
+        """Proxy one opaque, read-only work view without upgrading its authority."""
+
+        if not SAFE_WORK_VIEW_REF_RE.fullmatch(str(ref_id or "")):
+            raise HTTPException(status_code=400, detail="Invalid GlassHive workspace view reference")
+        record = resolve_signed_link_ref(ref_id)
+        payload = record.get("payload") if record else None
+        if not isinstance(payload, dict) or str(payload.get("kind") or "") != "worker_view":
+            raise HTTPException(status_code=401, detail="Invalid or expired GlassHive workspace link")
+        _require_short_ref_owner(payload, request)
+        worker_id = str(payload.get("worker_id") or "").strip()
+        if not SAFE_WORKER_ID_RE.fullmatch(worker_id):
+            raise HTTPException(status_code=401, detail="Invalid GlassHive workspace link")
+        target = f"{_runtime_proxy_base_url()}/w/{ref_id}"
+        upstream_headers = _runtime_headers_for_short_ref_payload(payload)
+        accept = str(request.headers.get("accept") or "").strip()
+        if accept:
+            upstream_headers["accept"] = accept
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as upstream:
+                upstream_response = await upstream.request(
+                    request.method,
+                    target,
+                    headers=upstream_headers,
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="GlassHive runtime view proxy failed") from exc
+        # A runtime redirect would expose the opaque bearer in both Location
+        # and browser history. The operator owns the public URL, so fail closed.
+        if 300 <= upstream_response.status_code < 400:
+            raise HTTPException(status_code=502, detail="GlassHive runtime view returned an unexpected redirect")
+        response_headers = {}
+        safe_response_headers = {
+            "cache-control": ("Cache-Control", "no-store"),
+            "pragma": ("Pragma", "no-cache"),
+            "content-security-policy": (
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+            "referrer-policy": ("Referrer-Policy", "no-referrer"),
+            "x-content-type-options": ("X-Content-Type-Options", "nosniff"),
+        }
+        for upstream_name, (response_name, fallback) in safe_response_headers.items():
+            response_headers[response_name] = str(
+                upstream_response.headers.get(upstream_name) or fallback
+            )
+        content_type = str(upstream_response.headers.get("content-type") or "").strip()
+        if content_type:
+            response_headers["Content-Type"] = content_type
+        response = Response(
+            content=upstream_response.content,
+            status_code=upstream_response.status_code,
+            headers=response_headers,
+        )
+        if upstream_response.status_code < 400:
+            _set_worker_cookie_from_payload(response, request, worker_id, payload)
+        return response
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         release = {
@@ -2467,6 +2629,10 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             ).strip(),
         }
         return {"status": "ok", "release": release, "runtime": client.health()}
+
+    @app.api_route("/w/{ref_id}", methods=["GET", "HEAD"])
+    async def runtime_work_view(ref_id: str, request: Request) -> Response:
+        return await _runtime_work_view_proxy(ref_id, request)
 
     @app.get("/r/{ref_id}")
     def open_short_link(ref_id: str, request: Request) -> Response:
@@ -3776,7 +3942,11 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
     @app.websocket("/novnc/{worker_id}/websockify")
     async def novnc_websocket(websocket: WebSocket, worker_id: str) -> None:
         try:
-            _require_interactive_access(websocket, worker_id)
+            if _uses_worker_view_credential(websocket, worker_id):
+                # noVNC is bidirectional (keyboard/mouse/clipboard/protocol
+                # messages), so it cannot truthfully be exposed as read-only.
+                await websocket.close(code=1008, reason="GlassHive view link is read-only")
+                return
             active_client = _client_for_request(websocket, worker_id, internal_details=True)
             view_url = _runtime_view_url(active_client, worker_id)
             parsed = urlparse(view_url)
@@ -3943,10 +4113,6 @@ def create_app(runtime_client: RuntimeClient | None = None) -> FastAPI:
             if redirect is not None:
                 return redirect
         return await _runtime_proxy("v1", runtime_path, request)
-
-    @app.get("/w/{ref_id}")
-    async def mission_view(ref_id: str, request: Request) -> Response:
-        return await _runtime_proxy("w", ref_id, request)
 
     @app.get("/")
     def home(request: Request) -> Response:

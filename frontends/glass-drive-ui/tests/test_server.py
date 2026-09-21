@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -215,7 +216,6 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_DEFAULT_OWNER_ID",
         "GLASSHIVE_ENTERPRISE_MODE",
         "GLASSHIVE_PUBLIC_LINKS_ONLY",
-        "GLASSHIVE_SECURITY_MODE",
         "WPR_ENTERPRISE_MODE",
         "GLASSHIVE_AUTH_MODE",
         "GLASSHIVE_ENTERPRISE_TENANT_ID",
@@ -281,14 +281,15 @@ def clear_glasshive_ui_env(monkeypatch, tmp_path):
         "GLASSHIVE_PROVIDER_ACCOUNT_ISOLATION",
         "WPR_DEFAULT_EXECUTION_MODE",
         "WPR_ALLOWED_WORKER_PROFILES",
+        "WPR_DB_PATH",
         "WPR_LINK_REF_TTL_SECONDS",
         "VIVENTIUM_ENV_FILE",
         "VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV",
     ):
         monkeypatch.delenv(name, raising=False)
-    # Tests must never inherit an installed user's App Support runtime.env. Each case
-    # owns its complete synthetic environment through monkeypatch.
-    monkeypatch.setenv("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "true")
+    # Keep unit tests isolated from the currently installed Viventium runtime.
+    # Individual runtime-env loading tests opt into their own synthetic env file.
+    monkeypatch.setenv("VIVENTIUM_DISABLE_DEFAULT_RUNTIME_ENV", "1")
     monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(tmp_path / "link_refs.sqlite3"))
     server_module._NOVNC_VIEW_URL_CACHE.clear()
     server_module._NOVNC_ASSET_CACHE.clear()
@@ -1850,7 +1851,6 @@ def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatc
     monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
     monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "1")
     monkeypatch.setenv("GLASSHIVE_WATCH_SESSION_STATE_PATH", str(tmp_path / "watch-sessions.sqlite3"))
-    token = signed_worker_token(secret)
     upstreams = []
 
     class FakeUpstream:
@@ -1886,60 +1886,17 @@ def test_active_novnc_websocket_closes_at_watch_session_cap(tmp_path, monkeypatc
     monkeypatch.setattr(server_module.websockets, "connect", fake_connect)
     client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
 
+    # An authenticated operator websocket remains interactive, but is bounded
+    # by the configured session cap. Shareable worker_view links are rejected
+    # by the separate read-only capability regression.
     with client.websocket_connect(
-        f"/novnc/wrk_1/websockify?gh_token={token}",
+        "/novnc/wrk_1/websockify",
         headers={
             "X-Viventium-Tenant-Id": "tenant-alpha",
             "X-Viventium-User-Id": "user-a",
             "X-Viventium-User-Role": "member",
         },
     ) as websocket:
-        with pytest.raises(WebSocketDisconnect) as exc:
-            websocket.receive_text()
-
-    assert exc.value.code == 1008
-    assert upstreams and upstreams[0].closed is True
-
-
-def test_active_novnc_websocket_is_revoked_when_workspace_closes(monkeypatch):
-    upstreams = []
-
-    class FakeUpstream:
-        def __init__(self):
-            self.closed = False
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            self.closed = True
-            return False
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            await asyncio.sleep(30)
-            raise StopAsyncIteration
-
-        async def send(self, message):
-            _ = message
-
-        async def close(self):
-            self.closed = True
-
-    def fake_connect(*args, **kwargs):
-        _ = args, kwargs
-        upstream = FakeUpstream()
-        upstreams.append(upstream)
-        return upstream
-
-    monkeypatch.setattr(server_module.websockets, "connect", fake_connect)
-    runtime = FakeRuntimeClient()
-    client = TestClient(create_app(runtime_client=runtime))
-
-    with client.websocket_connect("/novnc/wrk_1/websockify") as websocket:
-        runtime.worker_state = "termination_failed"
         with pytest.raises(WebSocketDisconnect) as exc:
             websocket.receive_text()
 
@@ -2207,171 +2164,17 @@ def test_launcher_workspace_hive_static_controls():
     assert 'white-space: normal' in styles_css
 
 
-def test_open_completed_workspace_never_resumes_compute_implicitly():
-    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
-    start = app_js.index("async function openWorkspaceSurface")
-    end = app_js.index("async function runWorkerAction", start)
-    open_workspace = app_js[start:end]
+def test_live_workspace_preview_cap_preserves_fourth_card_and_cleans_frames():
+    static_dir = Path(server_module.__file__).parent / "static"
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
 
-    assert "workspace?.workspace_url || workspace?.watch_url" in open_workspace
-    assert "shouldResumeOnWorkspaceOpen" in open_workspace
-    assert "renderedState: button?.closest('.workspace-tile')?.dataset.displayState" in open_workspace
-    assert "fallbackState: workspaceStateLabel(workspace)" in open_workspace
-    assert "rawWorkspaceState(workspace)" not in open_workspace
-    assert "Boolean(workspace?.compute_released_at)" not in open_workspace
-    assert "'/action/resume'" in open_workspace
-
-
-def test_watch_footer_composer_keeps_instruction_wide_and_send_compact():
-    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
-
-    def rule_body(selector: str) -> str:
-        start = styles.index(f"{selector} {{")
-        return styles[start : styles.index("}", start)]
-
-    textarea_rule = rule_body(".steer-form textarea")
-    send_rule = rule_body(".steer-form #send-button")
-
-    assert "grid-column: 2;" in textarea_rule
-    assert "min-width: 0;" in textarea_rule
-    assert "grid-column: 3;" in send_rule
-    assert "width: auto;" in send_rule
-    assert "min-width: 96px;" in send_rule
-    assert ".steer-form #send-button { grid-column: 1 / -1; width: 100%; }" not in styles
-
-
-def test_main_frame_is_visible_without_waiting_for_a_compositor_animation():
-    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
-    start = styles.index(".composer-frame {")
-    composer_rule = styles[start : styles.index("}", start)]
-
-    assert "animation:" not in composer_rule
-    assert "@keyframes float-up" not in styles
-
-
-def test_workspace_open_resume_policy_uses_the_user_visible_state():
-    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
-    result = subprocess.run(
-        [
-            "node",
-            "--input-type=module",
-            "--eval",
-            (
-                f"import {{ shouldResumeOnWorkspaceOpen }} from {json.dumps(policy_module)};"
-                "const states = ['completed','failed','cancelled','running','paused','idle','idle_terminated','stopped'];"
-                "const outcomes = Object.fromEntries(states.map(renderedState => [renderedState, "
-                "shouldResumeOnWorkspaceOpen({workspaceKind:'named', renderedState, fallbackState:'paused'})]));"
-                "outcomes.fallbackPaused = shouldResumeOnWorkspaceOpen({workspaceKind:'named', renderedState:'', fallbackState:'paused'});"
-                "outcomes.oneOffPaused = shouldResumeOnWorkspaceOpen({workspaceKind:'run', renderedState:'paused', fallbackState:'paused'});"
-                "process.stdout.write(JSON.stringify(outcomes));"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert json.loads(result.stdout) == {
-        "completed": False,
-        "failed": False,
-        "cancelled": False,
-        "running": False,
-        "paused": True,
-        "idle": True,
-        "idle_terminated": True,
-        "stopped": True,
-        "fallbackPaused": True,
-        "oneOffPaused": False,
-    }
-
-
-def test_workspace_native_tool_setup_uses_the_selected_profile_without_connector_wiring():
-    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
-    result = subprocess.run(
-        [
-            "node",
-            "--input-type=module",
-            "--eval",
-            (
-                f"import {{ workspaceSetupAction }} from {json.dumps(policy_module)};"
-                "process.stdout.write(JSON.stringify({"
-                "codex:workspaceSetupAction('codex-cli'),"
-                "claude:workspaceSetupAction('claude-code'),"
-                "openclaw:workspaceSetupAction('openclaw-general'),"
-                "unknown:workspaceSetupAction('custom-worker')"
-                "}));"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert json.loads(result.stdout) == {
-        "codex": "codex",
-        "claude": "claude",
-        "openclaw": "openclaw",
-        "unknown": "terminal",
-    }
-
-    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
-    assert "Set up tools" in app_js
-    assert "workspaceSetupAction(workspace?.profile)" in app_js
-    assert "workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`)" in app_js
-    assert "workspace?.workspace_url || workspace?.watch_url" in app_js
-
-
-def test_failed_workspace_keeps_the_recommended_pause_recovery_visible():
-    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
-    result = subprocess.run(
-        [
-            "node",
-            "--input-type=module",
-            "--eval",
-            (
-                f"import {{ workspaceLifecycleControl }} from {json.dumps(policy_module)};"
-                "const states = ['failed','cancelled','interrupted','completed','paused','terminated'];"
-                "process.stdout.write(JSON.stringify(Object.fromEntries(states.map(state => "
-                "[state, workspaceLifecycleControl(state)]))));"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    controls = json.loads(result.stdout)
-    for state in ("failed", "cancelled", "interrupted"):
-        assert controls[state] == {
-            "action": "pause",
-            "label": "Pause",
-            "hidden": False,
-            "disabled": False,
-        }
-    assert controls["completed"] == {
-        "action": "resume",
-        "label": "Continue",
-        "hidden": False,
-        "disabled": False,
-    }
-    assert controls["paused"] == {
-        "action": "resume",
-        "label": "Resume",
-        "hidden": False,
-        "disabled": False,
-    }
-    assert controls["terminated"] == {
-        "action": "pause",
-        "label": "Pause",
-        "hidden": True,
-        "disabled": True,
-    }
-
-
-def test_watch_authenticated_actions_forward_current_csrf_cookie():
-    watch_js = (Path(server_module.STATIC_DIR) / "watch.js").read_text(encoding="utf-8")
-
-    assert "glasshive_csrf" in watch_js
-    assert "function csrfHeaders(headers = {})" in watch_js
-    assert "'X-GlassHive-CSRF': token" in watch_js
-    assert watch_js.count("headers: csrfHeaders(") == 2
+    assert re.search(r"const MAX_VIEW_ONLY_PREVIEWS = 3;", app_js)
+    assert "previewWorkerIds(" in app_js
+    assert "MAX_VIEW_ONLY_PREVIEWS" in app_js
+    assert "const alreadyHasFrame = Boolean(pane.querySelector('.workspace-live-preview'));" in app_js
+    assert "workspace-live-preview" in app_js
+    assert "pane.replaceChildren(note);" in app_js
+    assert "pane.replaceChildren();" in app_js
 
 
 def test_worker_lifecycle_endpoint_supports_workspace_hive_controls():
@@ -3076,6 +2879,64 @@ def test_signed_watch_token_is_worker_scoped_for_control_and_desktop_routes(monk
     assert runtime.header_contexts == []
 
 
+def test_signed_worker_view_allows_only_narrow_communication_after_cookie_bootstrap(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = signed_worker_token(secret)
+
+    # The GET is a valid read-only watch bootstrap and stores the scoped token
+    # in an HttpOnly cookie. Neither the explicit bearer nor that cookie may be
+    # promoted into a mutable member session.
+    assert client.get(f"/watch/wrk_1?gh_token={token}").status_code == 200
+    probes = [
+        ("post", "/api/worker/wrk_1/metadata", {"favorite": True}),
+        ("post", "/api/worker/wrk_1/action/pause", None),
+        ("post", "/api/worker/wrk_1/action/resume", None),
+        ("post", "/api/worker/wrk_1/action/interrupt", None),
+        ("post", "/api/worker/wrk_1/action/terminate", None),
+        ("post", "/api/worker/wrk_1/action/browser", {"url": "https://example.test"}),
+        ("post", "/v1/workers/wrk_1/pause", None),
+        ("patch", "/ui/workers/wrk_1", {"favorite": True}),
+    ]
+    for method, path, body in probes:
+        request = getattr(client, method)
+        response = request(path, json=body) if body is not None else request(path)
+        assert response.status_code == 403, path
+
+    assert client.post(
+        "/api/worker/wrk_1/message",
+        json={"message": "Share progress."},
+    ).status_code == 200
+    assert client.post(
+        "/api/worker/wrk_1/steer",
+        json={"message": "Focus on the requested result."},
+    ).status_code == 200
+    assert runtime.steer_requests == [
+        {"worker_id": "wrk_1", "message": "Focus on the requested result."}
+    ]
+    assert runtime.message_requests == [
+        {"worker_id": "wrk_1", "message": "Share progress."}
+    ]
+    assert runtime.metadata_requests == []
+    assert runtime.lifecycle_requests == []
+    assert runtime.desktop_actions == []
+
+
+def test_signed_worker_view_cannot_open_interactive_novnc_websocket(monkeypatch):
+    secret = "ui-signed-link-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    token = signed_worker_token(secret)
+
+    with pytest.raises(WebSocketDisconnect) as captured:
+        with client.websocket_connect(f"/novnc/wrk_1/websockify?gh_token={token}"):
+            pass
+
+    assert captured.value.code == 1008
+
+
 def test_runtime_proxy_strips_signed_query_params_before_upstream(monkeypatch):
     service_secret = "ui-service-secret"
     signed_secret = "ui-signed-link-secret"
@@ -3119,7 +2980,244 @@ def test_runtime_proxy_strips_signed_query_params_before_upstream(monkeypatch):
     assert captured["headers"]["X-Viventium-User-Id"] == "user-a"
 
 
-def test_novnc_submodule_imports_reject_signed_token_from_referer(monkeypatch):
+def test_operator_work_view_proxies_exact_opaque_ref_to_configured_runtime(monkeypatch):
+    runtime = FakeRuntimeClient()
+    captured = {}
+    signed_secret = "ui-signed-link-secret"
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", signed_secret)
+    ref_id = create_signed_link_ref(token=signed_worker_token(signed_secret))
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html><body>Read-only mission view</body></html>"
+        headers = {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+        }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.update(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers or {},
+                    "content": content,
+                }
+            )
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=runtime))
+
+    response = client.get(f"/w/{ref_id}?gh_token=must-not-be-forwarded")
+
+    assert response.status_code == 200
+    assert response.text == "<html><body>Read-only mission view</body></html>"
+    assert captured["method"] == "GET"
+    assert captured["url"] == f"http://runtime.test/w/{ref_id}"
+    assert captured["client_kwargs"]["follow_redirects"] is False
+    assert "X-WPR-Token" not in captured["headers"]
+    assert "X-Viventium-User-Id" not in captured["headers"]
+    assert runtime.lifecycle_requests == []
+
+
+def test_enterprise_work_view_preserves_security_and_authorizes_artifact_click(monkeypatch):
+    service_secret = "ui-service-secret"
+    signed_secret = "ui-signed-link-secret"
+    set_enterprise_ui_env(
+        monkeypatch,
+        service_secret=service_secret,
+        signed_secret=signed_secret,
+    )
+    monkeypatch.setenv("GLASSHIVE_TRUST_INBOUND_IDENTITY", "true")
+    worker_token = signed_worker_token(signed_secret)
+    worker_ref = create_signed_link_ref(token=worker_token)
+    artifact_token = signed_artifact_token(signed_secret, kind="artifact_open")
+    artifact_ref = create_signed_link_ref(token=artifact_token)
+    captured = []
+
+    class FakeUpstreamResponse:
+        def __init__(self, *, content, content_type, headers=None):
+            self.status_code = 200
+            self.content = content
+            self.headers = {"content-type": content_type, **(headers or {})}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            captured.append({"method": method, "url": url, "headers": headers or {}})
+            if f"/w/{worker_ref}" in url:
+                return FakeUpstreamResponse(
+                    content=f'<a href="/v1/link-refs/{artifact_ref}">Open</a>'.encode(),
+                    content_type="text/html; charset=utf-8",
+                    headers={
+                        "cache-control": "no-store",
+                        "pragma": "no-cache",
+                        "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+                        "referrer-policy": "no-referrer",
+                        "x-content-type-options": "nosniff",
+                    },
+                )
+            return FakeUpstreamResponse(
+                content=b"artifact bytes",
+                content_type="text/plain",
+            )
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    identity_headers = {
+        "X-GlassHive-Tenant-Id": "tenant-alpha",
+        "X-GlassHive-User-Id": "user-a",
+        "X-GlassHive-User-Role": "member",
+    }
+
+    view = client.get(f"/w/{worker_ref}", headers=identity_headers)
+
+    assert view.status_code == 200
+    assert view.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'"
+    assert view.headers["pragma"] == "no-cache"
+    assert f"{worker_cookie_name('wrk_1')}=" in view.headers["set-cookie"]
+    assert captured[0]["headers"]["X-WPR-Token"] == service_secret
+    assert captured[0]["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
+    assert captured[0]["headers"]["X-Viventium-User-Id"] == "user-a"
+
+    artifact = client.get(f"/v1/link-refs/{artifact_ref}")
+
+    assert artifact.status_code == 200
+    assert artifact.content == b"artifact bytes"
+    assert captured[1]["headers"]["X-WPR-Token"] == service_secret
+    assert captured[1]["headers"]["X-Viventium-Tenant-Id"] == "tenant-alpha"
+    assert captured[1]["headers"]["X-Viventium-User-Id"] == "user-a"
+
+
+@pytest.mark.parametrize(
+    "ref_id",
+    [
+        "not-a-view-ref",
+        "ghr_short",
+        "ghr_1234567890abcdef12345678%2Factions",
+    ],
+)
+def test_operator_work_view_rejects_invalid_opaque_ref_before_upstream(monkeypatch, ref_id):
+    class UnexpectedAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("invalid work-view refs must not reach the runtime")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", UnexpectedAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/w/{ref_id}")
+
+    assert response.status_code in {400, 404}
+
+
+def test_operator_work_view_preserves_runtime_invalid_ref_response(monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", signed_secret)
+    ref_id = create_signed_link_ref(token=signed_worker_token(signed_secret))
+
+    class FakeUpstreamResponse:
+        status_code = 401
+        content = b'{"detail":"Invalid or expired GlassHive workspace link"}'
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/w/{ref_id}")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or expired GlassHive workspace link"
+
+
+def test_operator_work_view_never_proxies_mutations(monkeypatch):
+    ref_id = "ghr_1234567890abcdef12345678"
+
+    class UnexpectedAsyncClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("work-view mutations must not reach the runtime")
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", UnexpectedAsyncClient)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    action = client.post(f"/w/{ref_id}/actions/terminate")
+    desktop = client.post(f"/w/{ref_id}/desktop-action", json={"action": "terminal"})
+    direct = client.post(f"/w/{ref_id}")
+
+    assert action.status_code in {404, 405}
+    assert desktop.status_code in {404, 405}
+    assert direct.status_code == 405
+    assert runtime.lifecycle_requests == []
+    assert runtime.desktop_actions == []
+
+
+def test_operator_work_view_does_not_expose_ref_in_upstream_redirect(monkeypatch):
+    signed_secret = "ui-signed-link-secret"
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", signed_secret)
+    ref_id = create_signed_link_ref(token=signed_worker_token(signed_secret))
+
+    class FakeUpstreamResponse:
+        status_code = 307
+        content = b""
+        headers = {"location": f"http://runtime.test/w/{ref_id}"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    response = client.get(f"/w/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 502
+    assert "location" not in response.headers
+    assert ref_id not in response.text
+
+
+def test_novnc_submodule_imports_can_inherit_signed_token_from_referer(monkeypatch):
     secret = "ui-signed-link-secret"
     monkeypatch.setenv("WPR_API_TOKEN", secret)
     runtime = FakeRuntimeClient()
@@ -3173,7 +3271,7 @@ def test_signed_watch_sets_worker_scoped_cookie(monkeypatch):
     assert runtime.lifecycle_requests == []
 
 
-def test_short_worker_view_ref_can_auto_resume_when_configured(monkeypatch):
+def test_short_worker_view_ref_stays_read_only_when_legacy_auto_resume_is_configured(monkeypatch):
     secret = "ui-signed-link-secret"
     monkeypatch.setenv("WPR_API_TOKEN", secret)
     monkeypatch.setenv("GLASSHIVE_WORKSPACE_LINK_AUTO_RESUME", "true")
@@ -3190,7 +3288,7 @@ def test_short_worker_view_ref_can_auto_resume_when_configured(monkeypatch):
     assert response.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
     assert "gh_token=" not in response.headers["location"]
     assert runtime.worker_view_open_requests == ["wrk_1"]
-    assert runtime.lifecycle_requests == [{"worker_id": "wrk_1", "action": "resume"}]
+    assert runtime.lifecycle_requests == []
 
 
 def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
@@ -3216,77 +3314,30 @@ def test_short_worker_view_ref_redirects_and_sets_worker_cookie(monkeypatch):
     assert "SameSite=lax" in set_cookie
 
 
-def test_enterprise_short_worker_view_ref_accepts_the_authenticated_browser_session(
+@pytest.mark.parametrize("failure_kind, expected_status", [("terminated", 404), ("unavailable", 503)])
+def test_short_worker_view_ref_requires_authoritative_runtime_acceptance(
     tmp_path,
     monkeypatch,
+    failure_kind,
+    expected_status,
 ):
-    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
-    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "300")
+    secret = "ui-signed-link-secret"
+    mismatched_runtime_db = tmp_path / "ambient" / "wrong-runtime.db"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    monkeypatch.setenv("WPR_DB_PATH", str(mismatched_runtime_db))
 
-    class SessionAuth:
-        mode = "oidc"
-        session_enabled = True
+    class RejectingRuntime(FakeRuntimeClient):
+        def record_worker_view_open(self, worker_id: str):
+            self.worker_view_open_requests.append(worker_id)
+            request = httpx.Request("POST", f"http://runtime.test/v1/workers/{worker_id}/view-opened")
+            if failure_kind == "unavailable":
+                raise httpx.ConnectError("synthetic runtime unavailable", request=request)
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("synthetic terminated worker", request=request, response=response)
 
-        def resolve_session(self, token):
-            sessions = {
-                "owner-session": {
-                    "tenant_id": "tenant-alpha",
-                    "user_id": "user-a",
-                    "email": "owner@example.invalid",
-                    "role": "member",
-                },
-                "other-session": {
-                    "tenant_id": "tenant-alpha",
-                    "user_id": "user-b",
-                    "email": "other@example.invalid",
-                    "role": "member",
-                },
-            }
-            return sessions.get(token)
-
-    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: SessionAuth())
-    runtime = FakeRuntimeClient()
+    runtime = RejectingRuntime()
     client = TestClient(create_app(runtime_client=runtime))
-    token = server_module.sign_link_token(
-        kind="worker_view",
-        worker_id="wrk_1",
-        tenant_id="tenant-alpha",
-        owner_id="user-a",
-        ttl_seconds=60,
-    )
-    ref_id = create_signed_link_ref(
-        token=token,
-        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
-    )
-
-    client.cookies.set("glasshive_session", "owner-session")
-    accepted = client.get(f"/r/{ref_id}", follow_redirects=False)
-
-    assert accepted.status_code == 307
-    assert accepted.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
-    assert "gh_token=" not in accepted.headers["location"]
-    assert runtime.worker_view_open_requests == ["wrk_1"]
-
-    client.cookies.set("glasshive_session", "other-session")
-    denied = client.get(f"/r/{ref_id}", follow_redirects=False)
-
-    assert denied.status_code == 404
-    assert runtime.worker_view_open_requests == ["wrk_1"]
-
-
-def test_enterprise_short_worker_view_ref_recovers_an_expired_browser_session_via_login(
-    tmp_path,
-    monkeypatch,
-):
-    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
-    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
-    token = server_module.sign_link_token(
-        kind="worker_view",
-        worker_id="wrk_1",
-        tenant_id="tenant-alpha",
-        owner_id="user-a",
-        ttl_seconds=60,
-    )
+    token = signed_worker_token(secret)
     ref_id = create_signed_link_ref(
         token=token,
         target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
@@ -3294,124 +3345,37 @@ def test_enterprise_short_worker_view_ref_recovers_an_expired_browser_session_vi
 
     response = client.get(f"/r/{ref_id}", follow_redirects=False)
 
-    assert response.status_code == 303
-    assert response.headers["location"] == f"/login?return_to=%2Fr%2F{ref_id}"
+    assert response.status_code == expected_status
+    assert "location" not in response.headers
+    assert "set-cookie" not in response.headers
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+    assert not mismatched_runtime_db.exists()
 
 
-def test_runtime_artifact_ref_recovers_login_then_preserves_owner_scope(
+def test_direct_worker_view_token_requires_authoritative_runtime_acceptance(
     tmp_path,
     monkeypatch,
 ):
-    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
-    shared_dir = tmp_path / "shared-link-refs"
-    shared_dir.mkdir(mode=0o770)
-    os.chown(shared_dir, -1, os.getegid())
-    shared_dir.chmod(0o2770 if sys.platform.startswith("linux") else 0o770)
-    shared_path = shared_dir / "link_refs.sqlite3"
-    shared_path.touch(mode=0o660)
-    os.chown(shared_path, -1, os.getegid())
-    shared_path.chmod(0o660)
-    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(shared_path))
-    monkeypatch.setenv(
-        "GLASSHIVE_LINK_REF_SHARED_GROUP",
-        grp.getgrgid(os.getegid()).gr_name,
-    )
+    secret = "ui-signed-link-secret"
+    mismatched_runtime_db = tmp_path / "ambient" / "wrong-runtime.db"
+    monkeypatch.setenv("WPR_API_TOKEN", secret)
+    monkeypatch.setenv("WPR_DB_PATH", str(mismatched_runtime_db))
 
-    class SessionAuth:
-        mode = "oidc"
-        session_enabled = True
+    class UnavailableRuntime(FakeRuntimeClient):
+        def record_worker_view_open(self, worker_id: str):
+            self.worker_view_open_requests.append(worker_id)
+            request = httpx.Request("POST", f"http://runtime.test/v1/workers/{worker_id}/view-opened")
+            raise httpx.ConnectError("synthetic runtime unavailable", request=request)
 
-        def resolve_session(self, token):
-            identities = {
-                "owner-session": {
-                    "tenant_id": "tenant-alpha",
-                    "user_id": "user-a",
-                    "email": "owner@example.invalid",
-                    "role": "member",
-                },
-                "other-session": {
-                    "tenant_id": "tenant-alpha",
-                    "user_id": "user-b",
-                    "email": "other@example.invalid",
-                    "role": "member",
-                },
-            }
-            return identities.get(token)
+    runtime = UnavailableRuntime()
+    client = TestClient(create_app(runtime_client=runtime))
 
-    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: SessionAuth())
-    runtime_signed_links = load_runtime_signed_links_module()
-    artifact_token = runtime_signed_links.sign_link_token(
-        kind="artifact_open",
-        worker_id="wrk_1",
-        tenant_id="tenant-alpha",
-        owner_id="user-a",
-        path="workspace/index.html",
-    )
-    ref_id = runtime_signed_links.create_signed_link_ref(token=artifact_token)
+    response = client.get(f"/watch/wrk_1?gh_token={signed_worker_token(secret)}")
 
-    class FakeUpstreamResponse:
-        def __init__(self, status_code, content):
-            self.status_code = status_code
-            self.content = content
-            self.headers = {"content-type": "text/html; charset=utf-8"}
-
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def request(self, method, url, headers=None, content=None):
-            assertion = str((headers or {}).get("X-GlassHive-User-Assertion") or "")
-            claims = jwt.decode(
-                assertion,
-                options={"verify_signature": False},
-            )
-            if claims.get("sub") == "user-a":
-                return FakeUpstreamResponse(200, b"<h1>Hello World</h1>")
-            return FakeUpstreamResponse(404, b'{"detail":"GlassHive link not found"}')
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
-    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
-
-    signed_out = client.get(f"/v1/link-refs/{ref_id}", follow_redirects=False)
-    assert signed_out.status_code == 303
-    assert signed_out.headers["location"] == f"/login?return_to=%2Fv1%2Flink-refs%2F{ref_id}"
-
-    worker_cookie_name = f"glasshive_gh_token_{sha256(b'wrk_1').hexdigest()[:24]}"
-    worker_cookie_token = signed_links_module.sign_link_token(
-        kind="worker_view",
-        worker_id="wrk_1",
-        tenant_id="tenant-alpha",
-        owner_id="user-a",
-    )
-    client.cookies.set(worker_cookie_name, worker_cookie_token)
-    cookie_opened = client.get(f"/v1/link-refs/{ref_id}")
-    assert cookie_opened.status_code == 200
-    assert cookie_opened.content == b"<h1>Hello World</h1>"
-    client.cookies.delete(worker_cookie_name)
-
-    client.cookies.set(worker_cookie_name, "stale-or-corrupt-worker-cookie")
-    stale_cookie = client.get(f"/v1/link-refs/{ref_id}", follow_redirects=False)
-    assert stale_cookie.status_code == 303
-    assert stale_cookie.headers["location"] == (
-        f"/login?return_to=%2Fv1%2Flink-refs%2F{ref_id}"
-    )
-    client.cookies.delete(worker_cookie_name)
-
-    client.cookies.set("glasshive_session", "owner-session")
-    opened = client.get(f"/v1/link-refs/{ref_id}")
-    assert opened.status_code == 200
-    assert opened.content == b"<h1>Hello World</h1>"
-
-    client.cookies.set("glasshive_session", "other-session")
-    denied = client.get(f"/v1/link-refs/{ref_id}")
-    assert denied.status_code == 404
-    assert b"Hello World" not in denied.content
+    assert response.status_code == 503
+    assert "set-cookie" not in response.headers
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+    assert not mismatched_runtime_db.exists()
 
 
 def test_short_worker_view_ref_rejects_unconfigured_absolute_redirect_target(monkeypatch):
@@ -3607,16 +3571,17 @@ def test_short_worker_view_ref_ttl_config_can_expire_refs(monkeypatch):
 
 
 def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
+    view_ref = "ghr_1234567890abcdef12345678"
     raw = (
         'GET /novnc/wrk_1/websockify?gh_token=secret-token&gh_sig=signature&gh_exp=123 '
-        'GET /v1/signed-links/opaque-token?download=1'
+        f'GET /v1/signed-links/opaque-token?download=1 GET /w/{view_ref}'
     )
 
     cookie = f"Set-Cookie: {worker_cookie_name('wrk_1')}=worker-secret; HttpOnly; SameSite=lax"
 
     assert redact_sensitive_url_text(f"{raw} {cookie}") == (
         'GET /novnc/wrk_1/websockify?gh_token=[redacted]&gh_sig=[redacted]&gh_exp=[redacted] '
-        'GET /v1/signed-links/[redacted]?download=1 '
+        'GET /v1/signed-links/[redacted]?download=1 GET /w/[redacted] '
         f"Set-Cookie: {worker_cookie_name('wrk_1')}=[redacted]; HttpOnly; SameSite=lax"
     )
     assert redact_sensitive_url_text("gh_sig=signature&gh_token=secret-token") == (
@@ -3643,6 +3608,7 @@ def test_ui_sensitive_url_log_filter_redacts_signed_tokens():
     assert SensitiveUrlLogFilter().filter(record) is True
     assert "secret-token" not in record.args[0]
     assert "opaque-token" not in record.args[0]
+    assert view_ref not in record.args[0]
     assert "worker-secret" not in record.args[0]
     assert "gh_token=[redacted]" in record.args[0]
     assert f"{worker_cookie_name('wrk_1')}=[redacted]" in record.args[0]
@@ -3872,116 +3838,6 @@ def test_public_links_only_artifact_ref_is_bearer_but_raw_token_route_is_closed(
     assert response.status_code == 200
     assert captured["url"] == f"http://runtime.test/v1/link-refs/{ref_id}"
     assert client.get(f"/v1/signed-links/{token}").status_code == 404
-
-
-def test_public_links_only_nonexpiring_artifact_ref_outlives_embedded_token(monkeypatch):
-    secret = "public-link-secret"
-    now = {"value": 1_000}
-    monkeypatch.setattr(signed_links_module.time, "time", lambda: now["value"])
-    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
-    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
-    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_TTL_S", "60")
-    token = server_module.sign_link_token(
-        kind="artifact_open",
-        worker_id="wrk_1",
-        tenant_id="tenant-alpha",
-        owner_id="user-a",
-        path="workspace/report.txt",
-    )
-    ref_id = create_signed_link_ref(
-        token=token,
-        target_url=f"http://testserver/v1/signed-links/{token}",
-    )
-    assert signed_links_module.verify_signed_link_token(token) is not None
-
-    class FakeUpstreamResponse:
-        status_code = 200
-        content = b"<html><body>artifact preview</body></html>"
-        headers = {"content-type": "text/html; charset=utf-8"}
-
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def request(self, method, url, headers=None, content=None):
-            return FakeUpstreamResponse()
-
-    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
-    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
-    now["value"] = 1_061
-    assert signed_links_module.verify_signed_link_token(token) is None
-
-    response = client.get(f"/v1/link-refs/{ref_id}")
-
-    assert response.status_code == 200
-    bypass = client.get(f"/v1/link-refs/ghr_unknown_123456?gh_token={token}")
-    assert bypass.status_code == 401
-
-
-def test_public_links_only_artifact_ref_still_enforces_ref_ttl_and_revocation(monkeypatch):
-    secret = "public-link-secret"
-    now = {"value": 1_000}
-    monkeypatch.setattr(signed_links_module.time, "time", lambda: now["value"])
-    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
-    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
-    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "60")
-    token = signed_artifact_token(secret, kind="artifact_open")
-    expiring_ref = create_signed_link_ref(
-        token=token,
-        target_url=f"http://testserver/v1/signed-links/{token}",
-    )
-    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
-
-    now["value"] = 1_061
-
-    assert client.get(f"/v1/link-refs/{expiring_ref}").status_code == 401
-
-    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "0")
-    now["value"] = 2_000
-    token = signed_artifact_token(secret, kind="artifact_open")
-    revoked_ref = create_signed_link_ref(
-        token=token,
-        target_url=f"http://testserver/v1/signed-links/{token}",
-    )
-    assert revoke_signed_link_refs_for_worker("wrk_1") == 1
-    assert client.get(f"/v1/link-refs/{revoked_ref}").status_code == 401
-
-
-def test_public_links_only_artifact_ref_ignores_unsigned_cache_and_rejects_hmac_tampering(monkeypatch):
-    secret = "public-link-secret"
-    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
-    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
-    token = signed_artifact_token(secret, kind="artifact_open")
-    ref_id = create_signed_link_ref(
-        token=token,
-        target_url=f"http://testserver/v1/signed-links/{token}",
-    )
-    state_path = os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]
-    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
-
-    with sqlite3.connect(state_path) as conn:
-        conn.execute(
-            "UPDATE signed_link_refs SET payload_json = ? WHERE ref_id = ?",
-            (json.dumps({"kind": "artifact_open", "worker_id": "wrk_other"}), ref_id),
-        )
-
-    resolved = resolve_signed_link_ref(ref_id)
-    assert resolved is not None
-    assert resolved["payload"]["worker_id"] == "wrk_1"
-
-    with sqlite3.connect(state_path) as conn:
-        conn.execute(
-            "UPDATE signed_link_refs SET token = ? WHERE ref_id = ?",
-            (f"{token}tampered", ref_id),
-        )
-
-    assert client.get(f"/v1/link-refs/{ref_id}").status_code == 401
 
 
 def test_enterprise_ui_requires_signed_link_secret_at_startup(monkeypatch):
@@ -4641,9 +4497,20 @@ def test_runtime_ui_proxy_injects_enterprise_identity(monkeypatch):
 
 
 @pytest.mark.parametrize("upstream_status", [200, 401, 403, 404])
-def test_mission_view_proxies_only_read_only_runtime_authority(monkeypatch, upstream_status):
+def test_mission_view_proxies_only_read_only_runtime_authority(tmp_path, monkeypatch, upstream_status):
     captured = []
-    ref_id = "ghr_1234567890abcdef"
+    service_secret = "runtime-service-secret"
+    signed_secret = "mission-view-secret"
+    monkeypatch.setenv("WPR_API_TOKEN", service_secret)
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", signed_secret)
+    monkeypatch.setenv(
+        "GLASSHIVE_LINK_REF_STATE_PATH",
+        str(tmp_path / "mission-view-link-refs.sqlite3"),
+    )
+    ref_id = create_signed_link_ref(
+        token=signed_worker_token(signed_secret),
+        target_url="/watch/wrk_1",
+    )
 
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -4671,14 +4538,21 @@ def test_mission_view_proxies_only_read_only_runtime_authority(monkeypatch, upst
     )
     assert response.status_code == upstream_status
     assert response.headers["content-security-policy"] == "default-src 'none'"
-    assert "set-cookie" not in response.headers
+    if upstream_status < 400:
+        assert "httponly" in response.headers["set-cookie"].lower()
+        assert "samesite=lax" in response.headers["set-cookie"].lower()
+    else:
+        assert "set-cookie" not in response.headers
     assert len(captured) == 1
     assert captured[0]["url"].startswith(f"http://runtime.test/w/{ref_id}")
-    assert all(key.lower() in {"accept", "content-type"} for key in captured[0]["headers"])
+    assert "Authorization" not in captured[0]["headers"]
+    assert captured[0]["headers"]["X-WPR-Token"] == service_secret
+    assert all(value != "unrelated" for value in captured[0]["headers"].values())
+    client.cookies.clear()
     assert client.post(f"/w/{ref_id}").status_code == 405
     assert client.post(f"/w/{ref_id}/actions/terminate").status_code == 404
     assert client.get(f"/w/{ref_id}/desktop").status_code == 404
-    assert client.get("/w/invalid").status_code == 404
+    assert client.get("/w/invalid").status_code == 400
     assert len(captured) == 1
 
 
@@ -6614,7 +6488,7 @@ def test_oidc_csrf_preserves_only_valid_signed_link_communication(tmp_path, monk
     assert message.status_code == 200
     assert steer.status_code == 200
     assert forbidden_metadata.status_code == 403
-    assert "csrf" in forbidden_metadata.json()["detail"].lower()
+    assert "read-only" in forbidden_metadata.json()["detail"].lower()
     assert forged_message.status_code == 403
     assert "csrf" in forged_message.json()["detail"].lower()
     assert cross_origin.status_code == 403
@@ -7131,3 +7005,524 @@ def test_tenant_admin_disable_fails_closed_when_schedule_authority_is_unavailabl
         {"principal_id": "member-user", "enabled": False}
     ]
     assert auth.updated == []
+
+
+def test_active_novnc_websocket_is_revoked_when_workspace_closes(monkeypatch):
+    upstreams = []
+
+    class FakeUpstream:
+        def __init__(self):
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.closed = True
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(30)
+            raise StopAsyncIteration
+
+        async def send(self, message):
+            _ = message
+
+        async def close(self):
+            self.closed = True
+
+    def fake_connect(*args, **kwargs):
+        _ = args, kwargs
+        upstream = FakeUpstream()
+        upstreams.append(upstream)
+        return upstream
+
+    monkeypatch.setattr(server_module.websockets, "connect", fake_connect)
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+
+    with client.websocket_connect("/novnc/wrk_1/websockify") as websocket:
+        runtime.worker_state = "termination_failed"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+
+    assert exc.value.code == 1008
+    assert upstreams and upstreams[0].closed is True
+
+
+def test_open_completed_workspace_never_resumes_compute_implicitly():
+    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    start = app_js.index("async function openWorkspaceSurface")
+    end = app_js.index("async function runWorkerAction", start)
+    open_workspace = app_js[start:end]
+
+    assert "workspace?.workspace_url || workspace?.watch_url" in open_workspace
+    assert "shouldResumeOnWorkspaceOpen" in open_workspace
+    assert "renderedState: button?.closest('.workspace-tile')?.dataset.displayState" in open_workspace
+    assert "fallbackState: workspaceStateLabel(workspace)" in open_workspace
+    assert "rawWorkspaceState(workspace)" not in open_workspace
+    assert "Boolean(workspace?.compute_released_at)" not in open_workspace
+    assert "'/action/resume'" in open_workspace
+
+
+def test_watch_footer_composer_keeps_instruction_wide_and_send_compact():
+    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
+
+    def rule_body(selector: str) -> str:
+        start = styles.index(f"{selector} {{")
+        return styles[start : styles.index("}", start)]
+
+    textarea_rule = rule_body(".steer-form textarea")
+    send_rule = rule_body(".steer-form #send-button")
+
+    assert "grid-column: 2;" in textarea_rule
+    assert "min-width: 0;" in textarea_rule
+    assert "grid-column: 3;" in send_rule
+    assert "width: auto;" in send_rule
+    assert "min-width: 96px;" in send_rule
+    assert ".steer-form #send-button { grid-column: 1 / -1; width: 100%; }" not in styles
+
+
+def test_main_frame_is_visible_without_waiting_for_a_compositor_animation():
+    styles = (Path(server_module.STATIC_DIR) / "styles.css").read_text(encoding="utf-8")
+    start = styles.index(".composer-frame {")
+    composer_rule = styles[start : styles.index("}", start)]
+
+    assert "animation:" not in composer_rule
+    assert "@keyframes float-up" not in styles
+
+
+def test_workspace_open_resume_policy_uses_the_user_visible_state():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ shouldResumeOnWorkspaceOpen }} from {json.dumps(policy_module)};"
+                "const states = ['completed','failed','cancelled','running','paused','idle','idle_terminated','stopped'];"
+                "const outcomes = Object.fromEntries(states.map(renderedState => [renderedState, "
+                "shouldResumeOnWorkspaceOpen({workspaceKind:'named', renderedState, fallbackState:'paused'})]));"
+                "outcomes.fallbackPaused = shouldResumeOnWorkspaceOpen({workspaceKind:'named', renderedState:'', fallbackState:'paused'});"
+                "outcomes.oneOffPaused = shouldResumeOnWorkspaceOpen({workspaceKind:'run', renderedState:'paused', fallbackState:'paused'});"
+                "process.stdout.write(JSON.stringify(outcomes));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "completed": False,
+        "failed": False,
+        "cancelled": False,
+        "running": False,
+        "paused": True,
+        "idle": True,
+        "idle_terminated": True,
+        "stopped": True,
+        "fallbackPaused": True,
+        "oneOffPaused": False,
+    }
+
+
+def test_workspace_native_tool_setup_uses_the_selected_profile_without_connector_wiring():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceSetupAction }} from {json.dumps(policy_module)};"
+                "process.stdout.write(JSON.stringify({"
+                "codex:workspaceSetupAction('codex-cli'),"
+                "claude:workspaceSetupAction('claude-code'),"
+                "openclaw:workspaceSetupAction('openclaw-general'),"
+                "unknown:workspaceSetupAction('custom-worker')"
+                "}));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "codex": "codex",
+        "claude": "claude",
+        "openclaw": "openclaw",
+        "unknown": "terminal",
+    }
+
+    app_js = (Path(server_module.STATIC_DIR) / "app.js").read_text(encoding="utf-8")
+    assert "Set up tools" in app_js
+    assert "workspaceSetupAction(workspace?.profile)" in app_js
+    assert "workerApiUrl(workerId, `/action/${encodeURIComponent(action)}`)" in app_js
+    assert "workspace?.workspace_url || workspace?.watch_url" in app_js
+
+
+def test_failed_workspace_keeps_the_recommended_pause_recovery_visible():
+    policy_module = (Path(server_module.STATIC_DIR) / "launch-policy.js").as_uri()
+    result = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            (
+                f"import {{ workspaceLifecycleControl }} from {json.dumps(policy_module)};"
+                "const states = ['failed','cancelled','interrupted','completed','paused','terminated'];"
+                "process.stdout.write(JSON.stringify(Object.fromEntries(states.map(state => "
+                "[state, workspaceLifecycleControl(state)]))));"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    controls = json.loads(result.stdout)
+    for state in ("failed", "cancelled", "interrupted"):
+        assert controls[state] == {
+            "action": "pause",
+            "label": "Pause",
+            "hidden": False,
+            "disabled": False,
+        }
+    assert controls["completed"] == {
+        "action": "resume",
+        "label": "Continue",
+        "hidden": False,
+        "disabled": False,
+    }
+    assert controls["paused"] == {
+        "action": "resume",
+        "label": "Resume",
+        "hidden": False,
+        "disabled": False,
+    }
+    assert controls["terminated"] == {
+        "action": "pause",
+        "label": "Pause",
+        "hidden": True,
+        "disabled": True,
+    }
+
+
+def test_watch_authenticated_actions_forward_current_csrf_cookie():
+    watch_js = (Path(server_module.STATIC_DIR) / "watch.js").read_text(encoding="utf-8")
+
+    assert "glasshive_csrf" in watch_js
+    assert "function csrfHeaders(headers = {})" in watch_js
+    assert "'X-GlassHive-CSRF': token" in watch_js
+    assert watch_js.count("headers: csrfHeaders(") == 2
+
+
+def test_enterprise_short_worker_view_ref_accepts_the_authenticated_browser_session(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    monkeypatch.setenv("GLASSHIVE_MAX_WATCH_SESSION_DURATION_S", "300")
+
+    class SessionAuth:
+        mode = "oidc"
+        session_enabled = True
+
+        def resolve_session(self, token):
+            sessions = {
+                "owner-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-a",
+                    "email": "owner@example.invalid",
+                    "role": "member",
+                },
+                "other-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-b",
+                    "email": "other@example.invalid",
+                    "role": "member",
+                },
+            }
+            return sessions.get(token)
+
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: SessionAuth())
+    runtime = FakeRuntimeClient()
+    client = TestClient(create_app(runtime_client=runtime))
+    token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+
+    client.cookies.set("glasshive_session", "owner-session")
+    accepted = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert accepted.status_code == 307
+    assert accepted.headers["location"] == "http://testserver/watch/wrk_1?surface=desktop"
+    assert "gh_token=" not in accepted.headers["location"]
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+
+    client.cookies.set("glasshive_session", "other-session")
+    denied = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert denied.status_code == 404
+    assert runtime.worker_view_open_requests == ["wrk_1"]
+
+
+def test_enterprise_short_worker_view_ref_recovers_an_expired_browser_session_via_login(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    token = server_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        ttl_seconds=60,
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/watch/wrk_1?surface=desktop&gh_token={token}",
+    )
+
+    response = client.get(f"/r/{ref_id}", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/login?return_to=%2Fr%2F{ref_id}"
+
+
+def test_runtime_artifact_ref_recovers_login_then_preserves_owner_scope(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_oidc_session_for_multi_user_connect_test(tmp_path, monkeypatch)
+    shared_dir = tmp_path / "shared-link-refs"
+    shared_dir.mkdir(mode=0o770)
+    os.chown(shared_dir, -1, os.getegid())
+    shared_dir.chmod(0o2770 if sys.platform.startswith("linux") else 0o770)
+    shared_path = shared_dir / "link_refs.sqlite3"
+    shared_path.touch(mode=0o660)
+    os.chown(shared_path, -1, os.getegid())
+    shared_path.chmod(0o660)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_STATE_PATH", str(shared_path))
+    monkeypatch.setenv(
+        "GLASSHIVE_LINK_REF_SHARED_GROUP",
+        grp.getgrgid(os.getegid()).gr_name,
+    )
+
+    class SessionAuth:
+        mode = "oidc"
+        session_enabled = True
+
+        def resolve_session(self, token):
+            identities = {
+                "owner-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-a",
+                    "email": "owner@example.invalid",
+                    "role": "member",
+                },
+                "other-session": {
+                    "tenant_id": "tenant-alpha",
+                    "user_id": "user-b",
+                    "email": "other@example.invalid",
+                    "role": "member",
+                },
+            }
+            return identities.get(token)
+
+    monkeypatch.setattr(server_module.HumanAuthGateway, "from_env", lambda: SessionAuth())
+    runtime_signed_links = load_runtime_signed_links_module()
+    artifact_token = runtime_signed_links.sign_link_token(
+        kind="artifact_open",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="workspace/index.html",
+    )
+    ref_id = runtime_signed_links.create_signed_link_ref(token=artifact_token)
+
+    class FakeUpstreamResponse:
+        def __init__(self, status_code, content):
+            self.status_code = status_code
+            self.content = content
+            self.headers = {"content-type": "text/html; charset=utf-8"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            assertion = str((headers or {}).get("X-GlassHive-User-Assertion") or "")
+            claims = jwt.decode(
+                assertion,
+                options={"verify_signature": False},
+            )
+            if claims.get("sub") == "user-a":
+                return FakeUpstreamResponse(200, b"<h1>Hello World</h1>")
+            return FakeUpstreamResponse(404, b'{"detail":"GlassHive link not found"}')
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    signed_out = client.get(f"/v1/link-refs/{ref_id}", follow_redirects=False)
+    assert signed_out.status_code == 303
+    assert signed_out.headers["location"] == f"/login?return_to=%2Fv1%2Flink-refs%2F{ref_id}"
+
+    worker_cookie_name = f"glasshive_gh_token_{sha256(b'wrk_1').hexdigest()[:24]}"
+    worker_cookie_token = signed_links_module.sign_link_token(
+        kind="worker_view",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+    )
+    client.cookies.set(worker_cookie_name, worker_cookie_token)
+    cookie_opened = client.get(f"/v1/link-refs/{ref_id}")
+    assert cookie_opened.status_code == 200
+    assert cookie_opened.content == b"<h1>Hello World</h1>"
+    client.cookies.delete(worker_cookie_name)
+
+    client.cookies.set(worker_cookie_name, "stale-or-corrupt-worker-cookie")
+    stale_cookie = client.get(f"/v1/link-refs/{ref_id}", follow_redirects=False)
+    assert stale_cookie.status_code == 303
+    assert stale_cookie.headers["location"] == (
+        f"/login?return_to=%2Fv1%2Flink-refs%2F{ref_id}"
+    )
+    client.cookies.delete(worker_cookie_name)
+
+    client.cookies.set("glasshive_session", "owner-session")
+    opened = client.get(f"/v1/link-refs/{ref_id}")
+    assert opened.status_code == 200
+    assert opened.content == b"<h1>Hello World</h1>"
+
+    client.cookies.set("glasshive_session", "other-session")
+    denied = client.get(f"/v1/link-refs/{ref_id}")
+    assert denied.status_code == 404
+    assert b"Hello World" not in denied.content
+
+
+def test_public_links_only_nonexpiring_artifact_ref_outlives_embedded_token(monkeypatch):
+    secret = "public-link-secret"
+    now = {"value": 1_000}
+    monkeypatch.setattr(signed_links_module.time, "time", lambda: now["value"])
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_TTL_S", "60")
+    token = server_module.sign_link_token(
+        kind="artifact_open",
+        worker_id="wrk_1",
+        tenant_id="tenant-alpha",
+        owner_id="user-a",
+        path="workspace/report.txt",
+    )
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    assert signed_links_module.verify_signed_link_token(token) is not None
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        content = b"<html><body>artifact preview</body></html>"
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            return FakeUpstreamResponse()
+
+    monkeypatch.setattr(server_module.httpx, "AsyncClient", FakeAsyncClient)
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+    now["value"] = 1_061
+    assert signed_links_module.verify_signed_link_token(token) is None
+
+    response = client.get(f"/v1/link-refs/{ref_id}")
+
+    assert response.status_code == 200
+    bypass = client.get(f"/v1/link-refs/ghr_unknown_123456?gh_token={token}")
+    assert bypass.status_code == 401
+
+
+def test_public_links_only_artifact_ref_still_enforces_ref_ttl_and_revocation(monkeypatch):
+    secret = "public-link-secret"
+    now = {"value": 1_000}
+    monkeypatch.setattr(signed_links_module.time, "time", lambda: now["value"])
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "60")
+    token = signed_artifact_token(secret, kind="artifact_open")
+    expiring_ref = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    now["value"] = 1_061
+
+    assert client.get(f"/v1/link-refs/{expiring_ref}").status_code == 401
+
+    monkeypatch.setenv("GLASSHIVE_LINK_REF_TTL_SECONDS", "0")
+    now["value"] = 2_000
+    token = signed_artifact_token(secret, kind="artifact_open")
+    revoked_ref = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    assert revoke_signed_link_refs_for_worker("wrk_1") == 1
+    assert client.get(f"/v1/link-refs/{revoked_ref}").status_code == 401
+
+
+def test_public_links_only_artifact_ref_ignores_unsigned_cache_and_rejects_hmac_tampering(monkeypatch):
+    secret = "public-link-secret"
+    monkeypatch.setenv("GLASSHIVE_PUBLIC_LINKS_ONLY", "true")
+    monkeypatch.setenv("GLASSHIVE_SIGNED_LINK_SECRET", secret)
+    token = signed_artifact_token(secret, kind="artifact_open")
+    ref_id = create_signed_link_ref(
+        token=token,
+        target_url=f"http://testserver/v1/signed-links/{token}",
+    )
+    state_path = os.environ["GLASSHIVE_LINK_REF_STATE_PATH"]
+    client = TestClient(create_app(runtime_client=FakeRuntimeClient()))
+
+    with sqlite3.connect(state_path) as conn:
+        conn.execute(
+            "UPDATE signed_link_refs SET payload_json = ? WHERE ref_id = ?",
+            (json.dumps({"kind": "artifact_open", "worker_id": "wrk_other"}), ref_id),
+        )
+
+    resolved = resolve_signed_link_ref(ref_id)
+    assert resolved is not None
+    assert resolved["payload"]["worker_id"] == "wrk_1"
+
+    with sqlite3.connect(state_path) as conn:
+        conn.execute(
+            "UPDATE signed_link_refs SET token = ? WHERE ref_id = ?",
+            (f"{token}tampered", ref_id),
+        )
+
+    assert client.get(f"/v1/link-refs/{ref_id}").status_code == 401

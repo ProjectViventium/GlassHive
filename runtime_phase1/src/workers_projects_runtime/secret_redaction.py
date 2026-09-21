@@ -7,7 +7,16 @@ from typing import Callable
 def _redact_pair_or_preserve_uri_authority(match: re.Match[str]) -> str:
     # Consume a syntactically valid URI host:port before scanning its path, so a long
     # path is not mistaken for the secret half. Path/query credentials still scan.
-    return match.group("uri_authority") or "[REDACTED_CREDENTIAL]"
+    uri_authority = match.group("uri_authority")
+    if uri_authority:
+        return uri_authority
+    value = match.group(0)
+    # This is a content-addressed, public artifact identity, not a credential.
+    # Preserve only the exact typed form; arbitrary label:value pairs still
+    # fail closed through the generic credential rule below.
+    if re.fullmatch(r"artifact_sha256:[a-f0-9]{64}", value):
+        return value
+    return "[REDACTED_CREDENTIAL]"
 
 
 # Preserve the pre-existing generic credential-pair family as well as known formats.

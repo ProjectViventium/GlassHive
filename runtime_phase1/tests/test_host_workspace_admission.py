@@ -119,7 +119,12 @@ def test_paused_reconciliation_refreshes_identity_without_resuming():
     from types import SimpleNamespace
     from workers_projects_runtime.service import WorkersProjectsService
     service = WorkersProjectsService.__new__(WorkersProjectsService)
-    service.store = SimpleNamespace(get_active_run=lambda _: None, has_queued_runs=lambda _: False)
+    service.store = SimpleNamespace(
+        get_active_run=lambda _: None,
+        has_queued_runs=lambda _: False,
+        has_queued_capacity_retry=lambda _: False,
+        has_queued_running_invariant_retry=lambda _: False,
+    )
     calls = []
     service._refresh_runtime_info = lambda worker_id, **kwargs: calls.append((worker_id, kwargs))
     service._reconcile_worker_row({"worker_id": "wrk_paused", "state": "paused", "last_error": "", "execution_mode": "host", "last_run_id": "run_finished"})

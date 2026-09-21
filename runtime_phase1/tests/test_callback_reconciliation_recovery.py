@@ -443,7 +443,12 @@ def test_restart_reconciles_and_delivers_one_exact_scheduler_failure_callback(
 
 
 def _scheduled_provider_worker(
-    store: Store, *, owner_id: str, fallback_profile: str = ""
+    store: Store,
+    *,
+    owner_id: str,
+    fallback_profile: str = "",
+    fallback_model: str = "",
+    fallback_effort: str = "",
 ) -> dict:
     project = store.create_project(
         owner_id,
@@ -460,15 +465,20 @@ def _scheduled_provider_worker(
         }
     }
     if fallback_profile:
+        authority = {
+            "version": 1,
+            "kind": "conversation_orchestrator",
+            "execution_mode": "docker",
+            "fallback_worker_profile": fallback_profile,
+        }
+        if fallback_model:
+            authority["fallback_worker_model"] = fallback_model
+        if fallback_effort:
+            authority["fallback_worker_reasoning_effort"] = fallback_effort
         bundle.update(
             {
                 "execution_policy": "parallel-clean-room-v1",
-                "viventium_launch_authority": {
-                    "version": 1,
-                    "kind": "conversation_orchestrator",
-                    "execution_mode": "docker",
-                    "fallback_worker_profile": fallback_profile,
-                },
+                "viventium_launch_authority": authority,
             }
         )
     return store.create_worker(
@@ -567,7 +577,9 @@ def test_authorized_fallback_already_in_cooldown_is_never_selected(
 ):
     store = Store(str(tmp_path / "scheduled-quota-unhealthy-fallback.sqlite3"))
     worker = _scheduled_provider_worker(
-        store, owner_id="scheduled-owner", fallback_profile="claude-code"
+        store,
+        owner_id="scheduled-owner",
+        fallback_profile="claude-code",
     )
     service = _service(store, monkeypatch)
     try:
@@ -664,7 +676,11 @@ def test_collected_quota_failure_survives_result_rewrapping_and_switches_to_fall
     health and continues on the authorized fallback worker instead of failing silently."""
     store = Store(str(tmp_path / "collected-quota-rewrap.sqlite3"))
     worker = _scheduled_provider_worker(
-        store, owner_id="scheduled-owner", fallback_profile="claude-code"
+        store,
+        owner_id="scheduled-owner",
+        fallback_profile="claude-code",
+        fallback_model="claude-code:claude-opus-5",
+        fallback_effort="medium",
     )
     service = _service(store, monkeypatch)
     runtime = _production_evidence_runtime(service.runtime)
@@ -697,7 +713,13 @@ def test_collected_quota_failure_survives_result_rewrapping_and_switches_to_fall
         assert switched is not None
         assert switched["provider_route_decision"] == "fallback_selected"
         assert switched["provider_route_profile"] == "claude-code"
-        assert store.get_worker(str(worker["worker_id"]))["profile"] == "claude-code"
+        switched_worker = store.get_worker(str(worker["worker_id"]))
+        assert switched_worker["profile"] == "claude-code"
+        assert switched_worker["execution_mode"] == "docker"
+        assert switched_worker["model"] == "claude-opus-5"
+        switched_bundle = json.loads(switched_worker["bootstrap_bundle_json"])
+        assert switched_bundle["provider_model"] == "claude-opus-5"
+        assert switched_bundle["env"]["WPR_CLAUDE_CODE_EFFORT"] == "medium"
         assert runtime._provider_route_evidence == {}
     finally:
         service.shutdown()
