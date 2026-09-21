@@ -191,6 +191,56 @@ def test_direct_worker_native_boundary_receives_exactly_one_pinned_capsule(
 
 
 @pytest.mark.parametrize("runtime_type", [ClaudeCodeRuntime, CodexCliRuntime])
+def test_resumed_direct_worker_verifies_resume_and_fresh_native_authority_commands(
+    tmp_path, monkeypatch, runtime_type
+):
+    capsule = (
+        "<viventium_feeling_state>\n"
+        "Synthetic resumed request-pinned state.\n"
+        "</viventium_feeling_state>"
+    )
+    runtime, worker = _direct_worker(tmp_path, runtime_type, capsule)
+    worker["_active_run_id"] = "run-native-authority-resume"
+    if runtime.runtime_name == "claude-code":
+        monkeypatch.setattr(
+            runtime, "_read_provider_session_key", lambda _worker: "session-claude"
+        )
+    else:
+        monkeypatch.setattr(
+            runtime, "_resumable_codex_session_key", lambda _worker: "session-codex"
+        )
+
+    command, _ = runtime._build_command(
+        worker,
+        "Resume one synthetic direct-worker task.",
+        runtime._runtime_info(worker),
+    )
+    assert command[:2] == ["bash", "-c"]
+    assert len(worker["_glasshive_native_authority_commands"]) == 2
+    receipt = runtime._native_provider_authority_receipt(
+        worker,
+        command=command,
+        run_id=worker["_active_run_id"],
+        model=worker["model"],
+    )
+    assert receipt is not None
+    assert receipt["model"] == worker["model"]
+
+    tampered = [*command]
+    tampered[-1] += "\n# synthetic tamper"
+    with pytest.raises(
+        RuntimeErrorBase,
+        match="resume wrapper differs from its verified commands",
+    ):
+        runtime._native_provider_authority_receipt(
+            worker,
+            command=tampered,
+            run_id=worker["_active_run_id"],
+            model=worker["model"],
+        )
+
+
+@pytest.mark.parametrize("runtime_type", [ClaudeCodeRuntime, CodexCliRuntime])
 @pytest.mark.parametrize("scope", ["all_agents", "conscious_agent", "unknown"])
 def test_direct_worker_native_boundary_never_embodies_disabled_scopes(
     tmp_path, runtime_type, scope

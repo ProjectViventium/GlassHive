@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -27,6 +28,46 @@ def wait_for_run(client: TestClient, run_id: str, timeout: float = 300.0) -> dic
             return run
         time.sleep(1.0)
     raise AssertionError(f"Run {run_id} did not settle within {timeout}s")
+
+
+def wait_for_run_state(
+    client: TestClient,
+    run_id: str,
+    expected_states: set[str],
+    timeout: float = 60.0,
+) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        response = client.get(f"/v1/runs/{run_id}")
+        assert response.status_code == 200
+        run = response.json()
+        if run["state"] in expected_states:
+            return run
+        if run["state"] in {"completed", "failed", "cancelled", "interrupted"}:
+            raise AssertionError(
+                f"Run settled as {run['state']} before reaching {sorted(expected_states)}"
+            )
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Run did not reach {sorted(expected_states)} within {timeout}s"
+    )
+
+
+def wait_for_worker_event(
+    client: TestClient,
+    worker_id: str,
+    event_type: str,
+    timeout: float = 60.0,
+) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        response = client.get(f"/v1/workers/{worker_id}/events")
+        assert response.status_code == 200
+        for event in response.json()["items"]:
+            if event["event_type"] == event_type:
+                return event
+        time.sleep(0.1)
+    raise AssertionError(f"Worker did not emit {event_type} within {timeout}s")
 
 
 def _create_project(client: TestClient, default_worker_profile: str) -> dict:
@@ -81,13 +122,20 @@ def test_live_codex_worker_can_run_and_resume(tmp_path):
             "role": "coder",
             "profile": "codex-cli",
             "backend": "openclaw",
+            "execution_mode": "host",
+            "bootstrap_profile": "codex-host",
         },
     ).json()
     assert codex_worker["runtime"] == "codex-cli"
 
     codex_run = client.post(
         f"/v1/workers/{codex_worker['worker_id']}/assign",
-        json={"instruction": "Reply with exactly CODEX_WORKER_OK and no other text."},
+        json={
+            "instruction": (
+                "Reply with a final section exactly named FINAL REPORT: followed by "
+                "CODEX_WORKER_OK."
+            )
+        },
     ).json()
     codex_done = wait_for_run(client, codex_run["run_id"])
     assert codex_done["state"] == "completed", codex_done
@@ -99,7 +147,12 @@ def test_live_codex_worker_can_run_and_resume(tmp_path):
 
     codex_resume_run = client.post(
         f"/v1/workers/{codex_worker['worker_id']}/message",
-        json={"message": "Reply with exactly CODEX_RESUME_OK and no other text."},
+        json={
+            "message": (
+                "Reply with a final section exactly named FINAL REPORT: followed by "
+                "CODEX_RESUME_OK."
+            )
+        },
     ).json()
     codex_resume_done = wait_for_run(client, codex_resume_run["run_id"])
     assert codex_resume_done["state"] == "completed", codex_resume_done
@@ -206,6 +259,8 @@ def test_live_claude_worker_can_run_and_resume(tmp_path):
             "role": "coder",
             "profile": "claude-code",
             "backend": "openclaw",
+            "execution_mode": "host",
+            "bootstrap_profile": "claude-host",
         },
     ).json()
     assert claude_worker["runtime"] == "claude-code"

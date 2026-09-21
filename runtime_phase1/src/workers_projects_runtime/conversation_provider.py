@@ -262,6 +262,12 @@ class HarnessModel:
     context_window: int
 
     def api_payload(self) -> dict[str, Any]:
+        # Preserve the established public ordering and append the native CLI
+        # default choice so existing clients do not reinterpret index zero.
+        effort_choices = [
+            *[choice for choice in self.effort_choices if choice != "default"],
+            *(["default"] if "default" in self.effort_choices else []),
+        ]
         return {
             "id": self.id,
             "object": "model",
@@ -270,7 +276,7 @@ class HarnessModel:
             "display_name": self.display_name,
             "harness_profile": self.harness_profile,
             "native_model": self.native_model,
-            "effort_choices": list(self.effort_choices),
+            "effort_choices": effort_choices,
             "recommended_effort": self.recommended_effort,
             "context_window": self.context_window,
             "readiness": _harness_readiness(self.harness_profile),
@@ -2678,8 +2684,91 @@ class ConversationProvider:
         self._detached_reconciliation_thread: threading.Thread | None = None
         self._detached_reconciliation_stop = threading.Event()
         self._last_retention_monotonic = 0.0
+        self.service.set_provider_request_reconciler(
+            self._reconcile_terminal_provider_requests
+        )
         self._apply_retention_policy()
+        self._reconcile_terminal_provider_requests("")
         self._resume_nonterminal_request_reconciliation()
+
+    def _reconcile_terminal_provider_requests(
+        self,
+        run_id: str,
+        *,
+        limit: int = 64,
+    ) -> int:
+        """Settle or resume provider projections after their native run stopped."""
+
+        if str(run_id or "").strip():
+            request_record = self.store.get_provider_request_for_run(str(run_id))
+            run = self.store.get_run(str(run_id))
+            request_state = str((request_record or {}).get("state") or "")
+            terminal_activity_exists = bool(
+                request_record
+                and request_state in TERMINAL_REQUEST_STATES
+                and any(
+                    str(item.get("event_type") or "") == request_state
+                    for item in self.store.list_provider_activity(
+                        str(request_record["request_id"])
+                    )
+                )
+            )
+            pending = (
+                [request_record]
+                if request_record
+                and run
+                and str(run.get("state") or "")
+                in {*TERMINAL_RUN_STATES, "needs_input"}
+                and (
+                    request_state not in TERMINAL_REQUEST_STATES
+                    or not terminal_activity_exists
+                )
+                else []
+            )
+            if pending and str(run.get("state") or "") == "failed":
+                activity_types = {
+                    str(item.get("event_type") or "")
+                    for item in self.store.list_provider_activity(
+                        str(request_record["request_id"])
+                    )
+                }
+                if self._context_recovery_eligible(
+                    request_record,
+                    run,
+                    activity_types,
+                ) or self._serial_fallback_eligible(
+                    request_record,
+                    run,
+                    activity_types,
+                ):
+                    pending = []
+        else:
+            try:
+                pending = self.store.list_provider_requests_pending_terminal_reconciliation(
+                    limit=limit
+                )
+            except (OSError, RuntimeError, ValueError):
+                return 0
+        reconciled = 0
+        for request_record in pending:
+            before_run_id = str(request_record.get("run_id") or "")
+            try:
+                result = self._sync(request_record)
+            except Exception as exc:
+                LOGGER.warning(
+                    "provider_terminal_reconciliation_failed request_id_sha256=%s error_type=%s",
+                    hashlib.sha256(
+                        str(request_record.get("request_id") or "").encode("utf-8")
+                    ).hexdigest()[:16],
+                    type(exc).__name__,
+                )
+                continue
+            if (
+                str(result.get("state") or "") in TERMINAL_REQUEST_STATES
+                or str(result.get("run_id") or "") != before_run_id
+            ):
+                reconciled += 1
+        return reconciled
 
     def _resume_nonterminal_request_reconciliation(self) -> None:
         """Reconnect durable provider requests to their native runs after an API restart."""
@@ -2842,7 +2931,9 @@ class ConversationProvider:
             "env": {**incoming_env, **effort_env},
             "provider_capabilities": provider_capabilities,
         }
-        projected = self._projected_request_uploads(payload)
+        projected = (
+            self._projected_request_uploads(payload) if self is not None else []
+        )
         if projected:
             bundle["files"] = merge_projected_upload_files(bundle.get("files"), projected)
         # This descriptor is authored from this authenticated request's image bytes.
@@ -3454,7 +3545,9 @@ class ConversationProvider:
                 run_state = "failed"
         execution_started = bool(run.get("started_at") or run_state != "queued")
         if execution_started and "started" not in activity_types:
-            self.store.add_provider_activity(request_id, "started", ACTIVITY_SUMMARIES["started"])
+            self.store.add_provider_activity_once(
+                request_id, "started", ACTIVITY_SUMMARIES["started"]
+            )
         # A harness log can become readable just before the processor's durable
         # run-state update is visible. Never publish native tool/file activity
         # ahead of the normalized `started` event.
@@ -3505,7 +3598,20 @@ class ConversationProvider:
                     return self.store.get_provider_request(request_id) or request_record
                 return DeferredFallbackStart(claimed, run)
             return self._start_serial_fallback(request_record, run)
-        final_state = "completed" if run_state == "completed" else ("cancelled" if run_state in {"cancelled", "interrupted"} else "failed")
+        involuntary_interruption = (
+            run_state == "interrupted"
+            and bool(run.get("failure_retryable"))
+            and bool(run.get("failure_structured"))
+        )
+        final_state = (
+            "completed"
+            if run_state == "completed"
+            else "failed"
+            if involuntary_interruption
+            else "cancelled"
+            if run_state in {"cancelled", "interrupted"}
+            else "failed"
+        )
         contract = self._saved_completion_contract(request_record)
         response_json = str(request_record.get("response_json") or "")
         if final_state == "completed" and contract and not response_json:
@@ -3524,7 +3630,9 @@ class ConversationProvider:
                 request_id, ("queued", "running"), state=final_state,
             ) or self.store.get_provider_request(request_id) or request_record
             if final_state not in activity_types:
-                self.store.add_provider_activity(request_id, final_state, ACTIVITY_SUMMARIES[final_state])
+                self.store.add_provider_activity_once(
+                    request_id, final_state, ACTIVITY_SUMMARIES[final_state]
+                )
         else:
             updated = self.store.commit_provider_request_terminal(
                 request_id, expected_run_id=run_id, state=final_state, response_json=response_json,
@@ -3879,7 +3987,9 @@ class ConversationProvider:
             "version": 1, "model": payload.model,
             "reasoning_effort": payload.reasoning_effort,
             "graph_control": graph_transfer_control(payload.tools, payload.tool_choice),
-            "delivery_control": messaging_delivery_control(audio_eligible=bool(payload.metadata.audio_eligible)),
+            "delivery_control": messaging_delivery_control(
+                audio_eligible=bool(payload.metadata and payload.metadata.audio_eligible)
+            ),
             "prompt_tokens": _usage(payload.messages, "")["prompt_tokens"],
         }
 

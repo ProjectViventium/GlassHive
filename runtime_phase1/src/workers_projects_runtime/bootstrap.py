@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import hmac
 import json
@@ -9,7 +10,7 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 from .auth import multi_user_security_enabled
 from .codex_plugins import provision_codex_official_marketplace
@@ -26,26 +27,13 @@ from typing import Any, Callable, TypeVar
 
 
 JsonDict = dict[str, Any]
-
-# This file owns the worker bootstrap boundary:
-#
-# - what the host is allowed to project into a worker
-# - which prompt files are materialized into the workspace
-# - which MCP/client config files are written for Codex and Claude
-# - how secrets stay out of ordinary interactive shell files
-#
-# Keep the editable worker-facing prompts at the top of the file. They are intentionally plain
-# strings so operators can review the actual text that lands in AGENTS.md / CLAUDE.md / CODEX.md
-# without chasing helper functions.
 PromptProducer = TypeVar("PromptProducer", bound=Callable[..., object])
-
 WORKER_PROMPT_LAYER_PRODUCER_BINDINGS: dict[str, tuple[str, ...]] = {}
-
 WORKER_PROMPT_LAYER_DECLARATION_ATTRIBUTE = (
     "__glasshive_worker_prompt_layer_declaration__"
 )
-
 WORKER_PROMPT_LAYER_EMISSION_ATTRIBUTE = "__glasshive_worker_prompt_emissions__"
+
 
 class WorkerPromptLayerText(str):
     """A prompt string carrying the producer identities that emitted it."""
@@ -59,8 +47,10 @@ class WorkerPromptLayerText(str):
         setattr(instance, WORKER_PROMPT_LAYER_EMISSION_ATTRIBUTE, emissions)
         return instance
 
+
 class WorkerPromptLayerDict(dict[str, Any]):
     """A prompt bundle carrying the producer identities that emitted it."""
+
 
 def worker_prompt_layer_emissions(
     value: object,
@@ -73,6 +63,7 @@ def worker_prompt_layer_emissions(
         for producer_ref, layer_names in emissions
         if isinstance(producer_ref, str) and isinstance(layer_names, tuple)
     )
+
 
 def emit_worker_prompt_layers(
     *,
@@ -99,6 +90,7 @@ def emit_worker_prompt_layers(
             f"Worker prompt producer output cannot carry identity: {producer_ref}"
         ) from exc
     return value
+
 
 def worker_prompt_layer_producer(
     *layer_names: str,
@@ -133,6 +125,36 @@ def worker_prompt_layer_producer(
         return emitted  # type: ignore[return-value]
 
     return register
+
+
+VIVENTIUM_FEELING_STATE_PREFIX = "<viventium_feeling_state"
+VIVENTIUM_FEELING_STATE_START = "<viventium_feeling_state>"
+VIVENTIUM_FEELING_STATE_END = "</viventium_feeling_state>"
+
+# This file owns the worker bootstrap boundary:
+#
+# - what the host is allowed to project into a worker
+# - which prompt files are materialized into the workspace
+# - which MCP/client config files are written for Codex and Claude
+# - how secrets stay out of ordinary interactive shell files
+#
+# Keep the editable worker-facing prompts at the top of the file. They are intentionally plain
+# strings so operators can review the actual text that lands in AGENTS.md / CLAUDE.md / CODEX.md
+# without chasing helper functions.
+PromptProducer = TypeVar("PromptProducer", bound=Callable[..., object])
+
+WORKER_PROMPT_LAYER_PRODUCER_BINDINGS: dict[str, tuple[str, ...]] = {}
+
+WORKER_PROMPT_LAYER_DECLARATION_ATTRIBUTE = (
+    "__glasshive_worker_prompt_layer_declaration__"
+)
+
+WORKER_PROMPT_LAYER_EMISSION_ATTRIBUTE = "__glasshive_worker_prompt_emissions__"
+
+
+
+
+
 
 VIVENTIUM_FEELING_STATE_PREFIX = "<viventium_feeling_state"
 
@@ -238,10 +260,12 @@ GLASSHIVE_WORKER_COMPLETION_CONTRACT = _worker_prompt("worker.completion_contrac
     "GlassHive completion contract:\n"
     "- Do the requested work before reporting completion.\n"
     "- Before `FINAL REPORT:`, inspect the concrete output/artifacts/tool results/visible state you produced against the user's request, success criteria, constraints, and files. Correct a detected mismatch. Report a concrete blocker only when you cannot complete it.\n"
-    "- For research/source-gathering work, preserve citations and evidence, respect the user's source/date/auth/scope constraints, and do not dump large raw webpages, docs, logs, or command outputs into the conversation context. If a source/date/auth/scope constraint excludes an item, do not use that item to support facts, scoring, or deliverables; record it only as rejected or out-of-scope evidence when useful. Keep source publication/evidence dates distinct from retrieval/access timestamps; an access date must not widen or replace a user-limited source window. If `glasshive-run/constraint-ledger.json` exists, its original request and typed continuation authority preserve the admitted input; interpret that input yourself. If you create research plans, specs, subagent prompts, or delegation notes, carry the user's constraints forward literally and exactly instead of widening, weakening, summarizing away, or rewriting them. If a plan/spec/delegation conflicts with the admitted user request or typed authority, correct that file before continuing. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
+    "- For research/source-gathering work, preserve citations and evidence, respect the user's source/date/auth/scope constraints, and do not dump large raw webpages, docs, logs, or command outputs into the conversation context. If a source/date/auth/scope constraint excludes an item, do not use that item to support facts, scoring, or deliverables; record it only as rejected or out-of-scope evidence when useful. Keep source publication/evidence dates distinct from retrieval/access timestamps; an access date must not widen or replace a user-limited source window. If `glasshive-run/constraint-ledger.json` exists, read it before planning, delegation, source collection, and final delivery; its original request and typed continuation authority preserve the admitted input, which you must interpret yourself. If you create research plans, specs, subagent prompts, or delegation notes, carry the user's constraints forward literally and exactly instead of widening, weakening, summarizing away, or rewriting them. If a plan/spec/delegation conflicts with the admitted user request or typed authority, correct that file before continuing. Save working notes/excerpts to files when useful and bring back concise source-grounded summaries so the task can continue without overflowing or destabilizing the provider route.\n"
+    "- `glasshive-run/` is reserved for internal harness support evidence, not user-facing artifacts. Save every user-facing artifact outside `glasshive-run/` so GlassHive can discover and deliver it.\n"
     "- For long-running work, keep durable checkpoints in workspace files and prioritize a usable core result before optional expansion. If time, tool, auth, or dependency limits prevent the full requested deliverable, stop with an honest partial artifact/report and the exact blocker instead of spending the entire run on private notes.\n"
     "- When the request calls for a report, document, deck, client deliverable, or other shareable work product and the user did not ask for a technical/source format, make the primary user-facing output a polished ordinary end-user artifact such as PDF, DOCX, PPTX, spreadsheet, or another appropriate professional format. Markdown, HTML, or source files may be included as supporting artifacts, but should not be the only default deliverable for that class of work unless the runtime cannot create a professional artifact; if blocked, say so concretely.\n"
     "- For visual/shareable artifacts such as PDFs, slide decks, screenshots, or HTML reports, open or render the final artifact itself and verify that key text, tables, images, and pages are readable, not clipped, and not overlapped. Correct a detected layout defect or state the specific remaining limitation before `FINAL REPORT:`.\n"
+    "- If you spawn any child agent, join every spawned child and incorporate its result before writing `FINAL REPORT:`. Do not report completion while a child remains running, open, or aborted.\n"
     "- Your final assistant message MUST end with a separate section exactly named `FINAL REPORT:`.\n"
     "- Put only the user-facing result after `FINAL REPORT:`. Include the concrete outcome, key facts, artifact/file names when useful, blockers, or the next decision needed.\n"
     "- If the user requested a very short answer or an exact string, put only that answer after `FINAL REPORT:`.\n"
@@ -371,6 +395,20 @@ USER_PROVIDER_SECRET_ENV_MARKERS = (
     "SESSION_TOKEN",
     "TOKEN",
 )
+RESERVED_HOST_RUNTIME_ENV_KEYS = {
+    "HOME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+}
+SERVER_ONLY_RUNTIME_ENV_KEYS = {
+    "VIVENTIUM_GLASSHIVE_SERVICE_ASSERTION_SECRET",
+    "VIVENTIUM_GLASSHIVE_ADMISSION_URL",
+    "VIVENTIUM_GLASSHIVE_ADMISSION_SECRET",
+}
 
 
 RESERVED_HOST_RUNTIME_ENV_KEYS = {

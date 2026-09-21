@@ -413,7 +413,7 @@ def test_delegation_atomically_reserves_one_project_worker_and_run(account_clien
         ).fetchone()[0] == 1
 
 
-def test_dead_lease_reconciliation_atomically_repairs_running_before_api_read(
+def test_dead_lease_reconciliation_keeps_unproved_generation_fenced_before_api_read(
     account_client,
 ):
     accepted = account_client.post(
@@ -446,20 +446,20 @@ def test_dead_lease_reconciliation_atomically_repairs_running_before_api_read(
         f"/v1/work/{work_ref}", headers=account_headers()
     )
 
-    assert reconciled == {"renewed": 0, "released": 1, "unchanged": 0}
+    assert reconciled == {"renewed": 0, "released": 0, "unchanged": 1}
     assert detail.status_code == 200, detail.text
-    assert detail.json()["state"] == "starting"
+    assert detail.json()["state"] == "running"
     durable = store.get_run(str(running["run_id"]))
     assert durable is not None
-    assert durable["state"] == "queued"
-    assert durable["runtime_invoked_at"] is None
-    assert durable["active_attempt_id"] == ""
+    assert durable["state"] == "running"
+    assert durable["runtime_invoked_at"] == running["runtime_invoked_at"]
+    assert durable["active_attempt_id"] == attempt_id
     attempts = store.list_run_attempts(str(running["run_id"]))
-    repaired_attempt = next(item for item in attempts if item["attempt_id"] == attempt_id)
-    assert repaired_attempt["state"] == "retry_queued"
-    assert repaired_attempt["ended_at"]
-    assert repaired_attempt["runtime_invoked_at"] == running["runtime_invoked_at"]
-    assert (store.get_host_run_lease(str(lease["lease_id"])) or {})["status"] == "released"
+    fenced_attempt = next(item for item in attempts if item["attempt_id"] == attempt_id)
+    assert fenced_attempt["state"] == "running"
+    assert fenced_attempt["ended_at"] is None
+    assert fenced_attempt["runtime_invoked_at"] == running["runtime_invoked_at"]
+    assert (store.get_host_run_lease(str(lease["lease_id"])) or {})["status"] == "active"
 
 
 def test_conversation_orchestrator_delegation_rejects_host_execution(account_client):
@@ -864,7 +864,7 @@ def test_parallel_clean_room_policy_cannot_be_replaced_by_a_later_runtime_bundle
             {"metadata": {"provider": {"api_key": "synthetic-provider-key"}}},
         ),
         (None, {"env": {"OPENAI_API_KEY": "synthetic-caller-provider-key"}}),
-        (None, {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "ultra"}}),
+        (None, {"env": {"WPR_CODEX_CLI_REASONING_EFFORT": "impossible"}}),
         (None, {"env": {"WPR_CLAUDE_CODE_EFFORT": "max "}}),
         (None, {"provider_credentials": {"api_key": "synthetic-provider-key"}}),
         (
@@ -910,7 +910,7 @@ def test_parallel_clean_room_policy_cannot_be_replaced_by_a_later_runtime_bundle
         "workspace-authority-file",
         "nested-provider-credentials",
         "caller-env",
-        "invalid-codex-effort",
+        "unsupported-codex-effort",
         "noncanonical-claude-effort",
         "provider-credentials",
         "caller-broker-grant",
@@ -1041,6 +1041,9 @@ def test_orchestration_capabilities_are_service_asserted_and_report_global_host_
         "isolatedParallelReason": "",
         "hostMissionsAllowed": False,
         "hostMissionsActive": 0,
+        "nativeParallelReady": False,
+        "nativeParallelReason": "native_parallel_not_authorized",
+        "sharedHostDesktop": False,
         **_healthy_capability_producers(),
     }
 
@@ -1065,6 +1068,9 @@ def test_orchestration_capabilities_preserve_structured_isolation_failure_reason
         "isolatedParallelReason": "parallel_clean_room_network_unconfigured",
         "hostMissionsAllowed": False,
         "hostMissionsActive": 0,
+        "nativeParallelReady": False,
+        "nativeParallelReason": "native_parallel_not_authorized",
+        "sharedHostDesktop": False,
         **_healthy_capability_producers(),
     }
 
@@ -3397,7 +3403,8 @@ def test_active_work_steer_preserves_original_task_for_run_evidence(account_clie
         worker=runtime_worker,
         run_id=replacement["run_id"],
     )
-    assert ledger["outputs"]["format_expectations"] == ["html"]
+    assert ledger["original_output_source"] == original_instruction
+    assert ledger["outputs"]["format_expectations"] == []
 
 
 def test_active_work_queue_persists_a_followup_without_interrupting_current_run(account_client):
@@ -5939,6 +5946,11 @@ def test_unbound_control_receipt_pending_and_failed_replays_require_reissue(
     restarted.state.service.start_assigned_run = lambda _worker_id: None
     restarted.state.service._ensure_worker_processor = lambda _worker_id: None
     with TestClient(restarted) as client:
+        before_replay_calls = (
+            runtime.pause_calls,
+            runtime.resume_calls,
+            runtime.interrupt_calls,
+        )
         body = {"action": action, "idempotencyKey": idempotency_key}
         if instruction:
             body["instruction"] = instruction
@@ -5968,9 +5980,11 @@ def test_unbound_control_receipt_pending_and_failed_replays_require_reissue(
             run["run_id"]: run["state"]
             for run in restarted.state.store.list_runs_for_worker(source["worker_id"])
         } == before_states
-        assert runtime.pause_calls == 0
-        assert runtime.resume_calls == 0
-        assert runtime.interrupt_calls == 0
+        assert (
+            runtime.pause_calls,
+            runtime.resume_calls,
+            runtime.interrupt_calls,
+        ) == before_replay_calls
 
 
 def test_active_work_roster_caps_rows_and_reports_overflow(account_client):
@@ -6803,7 +6817,8 @@ def test_queue_projects_trusted_prior_output_source_without_rewriting_new_goal(a
     runtime_worker = service._run_local_worker(store.get_worker(current["worker_id"]), run)
     ledger = build_constraint_ledger(instruction=run["instruction"], worker=runtime_worker, run_id=run["run_id"])
     assert run["instruction"] == correction
-    assert ledger["outputs"]["format_expectations"] == (["html"] if output_mode == "inherit" else ["pdf"])
+    assert ledger["outputs"]["format_expectations"] == ([] if output_mode == "inherit" else ["pdf"])
+    assert ledger["original_output_source"] == original
     assert json.loads(run["continuation_context_json"]) == {
         "version": 1, "base_instruction": original, "guidance": [correction],
     }

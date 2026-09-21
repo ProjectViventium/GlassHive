@@ -13,12 +13,13 @@ import stat
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Callable
 from urllib.error import URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .auth import multi_user_security_enabled
@@ -359,6 +360,50 @@ _DOCKER_CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 
 _DOCKER_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
+_RESOURCE_MEMORY_BYTES_PATH_KEY = "__glasshive_resource_memory_bytes"
+
+
+PARALLEL_CLEAN_ROOM_POLICY_LABEL = "com.viventium.parallel-clean-room.policy"
+PARALLEL_CLEAN_ROOM_ROLE_LABEL = "com.viventium.parallel-clean-room.role"
+PARALLEL_CLEAN_ROOM_PROVIDER_PROXY_ROLE = "provider-proxy"
+PARALLEL_CLEAN_ROOM_BROKER_PROXY_ROLE = "broker-proxy"
+PARALLEL_CLEAN_ROOM_MISSION_NETWORK_ROLE = "mission-network"
+PARALLEL_CLEAN_ROOM_WORKER_CONTAINER_LABEL = (
+    "com.viventium.parallel-clean-room.worker-container"
+)
+PARALLEL_CLEAN_ROOM_BROKER_ALIAS = "host.docker.internal"
+PARALLEL_CLEAN_ROOM_PROXY_IMAGE = "viventium-parallel-work-proxy:local"
+PARALLEL_CLEAN_ROOM_PROXY_USER = "glasshive"
+PARALLEL_CLEAN_ROOM_PROXY_ENTRYPOINT = ("python", "/app/proxy.py")
+PARALLEL_CLEAN_ROOM_PROXY_TMPFS = (
+    "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+)
+PARALLEL_CLEAN_ROOM_FORBIDDEN_CONTAINER_ENV_PREFIXES = (
+    "ANTHROPIC_",
+    "AWS_",
+    "AZURE_",
+    "CLAUDE_",
+    "GCP_",
+    "GITHUB_",
+    "GITLAB_",
+    "GOOGLE_",
+    "OPENAI_",
+    "PORTKEY_",
+)
+PARALLEL_CLEAN_ROOM_TMPFS = (
+    "/tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777",
+    "/run:rw,nosuid,nodev,noexec,size=64m,mode=755",
+    "/run/glasshive:rw,nosuid,nodev,noexec,size=16m,mode=700,uid=1200,gid=1201",
+    "/run/screen:rw,nosuid,nodev,noexec,size=8m,mode=1777,uid=1200,gid=1201",
+    "/var/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777",
+    "/var/log/supervisor:rw,nosuid,nodev,noexec,size=64m,mode=755",
+    "/opt/selenium/logs:rw,nosuid,nodev,noexec,size=256m,mode=755",
+    "/opt/selenium/assets:rw,nosuid,nodev,noexec,size=256m,mode=755",
+)
+_DOCKER_OBJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_DOCKER_NETWORK_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}\Z")
+_DOCKER_CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
+_DOCKER_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _RESOURCE_MEMORY_BYTES_PATH_KEY = "__glasshive_resource_memory_bytes"
 
 AI_WORKER_BROWSER_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
@@ -908,7 +953,11 @@ class DockerSandboxManager:
         self.memory_limit = os.environ.get("WPR_SANDBOX_MEMORY", "3g").strip()
         self.memory_swap_limit = os.environ.get("WPR_SANDBOX_MEMORY_SWAP", self.memory_limit).strip()
         self.cpu_limit = os.environ.get("WPR_SANDBOX_CPUS", "2").strip()
-        self.pids_limit = os.environ.get("WPR_SANDBOX_PIDS_LIMIT", "4096").strip()
+        # cgroup pids counts Linux tasks (including threads). Align the
+        # container ceiling with the conservative per-mission thread
+        # reservation instead of allowing a single worker 4096 tasks while the
+        # workstation-wide admission guard targets 2048.
+        self.pids_limit = os.environ.get("WPR_SANDBOX_PIDS_LIMIT", "512").strip()
         self.inspect_timeout_sec = float(os.environ.get("WPR_DOCKER_INSPECT_TIMEOUT_SEC", "5") or "5")
         self.inspect_cache_ttl_sec = float(os.environ.get("WPR_DOCKER_INSPECT_CACHE_TTL_SEC", "5") or "5")
         self.inspect_stale_ttl_sec = float(os.environ.get("WPR_DOCKER_INSPECT_STALE_TTL_SEC", "60") or "60")
@@ -1284,49 +1333,330 @@ class DockerSandboxManager:
             if cached and cached[0] + self.inspect_stale_ttl_sec > now:
                 return cached[1]
             return None
+        sandbox = self._sandbox_from_inspect_output(worker_id, result.stdout)
+        if sandbox is None:
+            if cached and cached[0] + self.inspect_stale_ttl_sec > now:
+                return cached[1]
+            return None
+        self._inspect_cache[worker_id] = (now, sandbox)
+        return sandbox
+
+    def inspect_fresh(
+        self,
+        worker_id: str,
+        *,
+        require_configured_image: bool = True,
+    ) -> FreshSandboxInspection:
+        """Probe Docker directly for clean-room secret admission authority."""
+        container_name = self._container_name(worker_id)
+        try:
+            result = self._docker(
+                ["inspect", container_name],
+                check=False,
+                capture_output=True,
+                timeout_sec=self.inspect_timeout_sec,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return FreshSandboxInspection(
+                status="unavailable",
+                reason="docker_inspect_failed",
+            )
+        if result.returncode != 0:
+            detail = str(result.stderr or result.stdout or "").lower()
+            if result.returncode == 1 and (
+                "no such object" in detail or "no such container" in detail
+            ):
+                if require_configured_image:
+                    configured_image, image_reason = (
+                        self._inspect_configured_image_fresh()
+                    )
+                    if configured_image is None:
+                        return FreshSandboxInspection(
+                            status="unavailable",
+                            reason=image_reason,
+                        )
+                self._invalidate_inspect_cache(worker_id)
+                return FreshSandboxInspection(
+                    status="confirmed_absent",
+                    reason="docker_confirmed_container_absent",
+                )
+            return FreshSandboxInspection(
+                status="unavailable",
+                reason=(
+                    "docker_inspect_timeout"
+                    if result.returncode == 124
+                    else "docker_inspect_failed"
+                ),
+            )
+        sandbox = self._sandbox_from_inspect_output(
+            worker_id,
+            result.stdout,
+            require_valid_container_id=True,
+        )
+        if sandbox is None:
+            return FreshSandboxInspection(
+                status="unavailable",
+                reason="docker_inspect_malformed",
+            )
+        if not require_configured_image:
+            self._inspect_cache[worker_id] = (time.monotonic(), sandbox)
+            return FreshSandboxInspection(status="present", sandbox=sandbox)
+        configured_image, image_reason = self._inspect_configured_image_fresh()
+        if configured_image is None:
+            return FreshSandboxInspection(
+                status="unavailable",
+                reason=image_reason,
+            )
+        sandbox.expected_image_id = configured_image.image_id
+        sandbox.expected_runtime_user = configured_image.runtime_user
+        sandbox.expected_entrypoint = configured_image.entrypoint
+        sandbox.expected_command = configured_image.command
+        sandbox.expected_environment = configured_image.environment
+        self._inspect_cache[worker_id] = (time.monotonic(), sandbox)
+        return FreshSandboxInspection(status="present", sandbox=sandbox)
+
+    def _inspect_configured_image_fresh(
+        self,
+    ) -> tuple[ConfiguredSandboxImage | None, str]:
+        try:
+            result = self._docker(
+                ["image", "inspect", self.image],
+                check=False,
+                capture_output=True,
+                timeout_sec=self.image_inspect_timeout_sec,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            return None, "docker_image_inspect_failed"
+        if result.returncode != 0:
+            return (
+                None,
+                "docker_image_inspect_timeout"
+                if result.returncode == 124
+                else "docker_image_inspect_failed",
+            )
         try:
             payload = json.loads(result.stdout or "[]")
-        except json.JSONDecodeError:
-            if cached and cached[0] + self.inspect_stale_ttl_sec > now:
-                return cached[1]
+        except (json.JSONDecodeError, TypeError):
+            return None, "docker_image_inspect_malformed"
+        if (
+            not isinstance(payload, list)
+            or len(payload) != 1
+            or not isinstance(payload[0], dict)
+        ):
+            return None, "docker_image_inspect_malformed"
+        entry = payload[0]
+        image_id = entry.get("Id")
+        config = entry.get("Config")
+        if (
+            not isinstance(image_id, str)
+            or not _DOCKER_IMAGE_ID.fullmatch(image_id)
+            or not isinstance(config, dict)
+            or "User" not in config
+            or "Cmd" not in config
+            or "Env" not in config
+        ):
+            return None, "docker_image_inspect_malformed"
+        runtime_user = config.get("User")
+        entrypoint_valid, entrypoint = _docker_command_tuple(
+            config.get("Entrypoint")
+        )
+        command_valid, command = _docker_command_tuple(config.get("Cmd"))
+        environment_valid, environment = _docker_environment_tuple(
+            config.get("Env")
+        )
+        if (
+            not isinstance(runtime_user, str)
+            or not entrypoint_valid
+            or not command_valid
+            or not environment_valid
+        ):
+            return None, "docker_image_inspect_malformed"
+        if (
+            self.user != "seluser"
+            or runtime_user != self.user
+            or _docker_user_is_root(runtime_user)
+            or _docker_user_is_root(self.user)
+        ):
+            return None, "configured_image_user_policy_mismatch"
+        return (
+            ConfiguredSandboxImage(
+                image_id=image_id,
+                runtime_user=runtime_user,
+                entrypoint=entrypoint,
+                command=command,
+                environment=environment,
+            ),
+            "",
+        )
+
+    def _sandbox_from_inspect_output(
+        self,
+        worker_id: str,
+        output: str | None,
+        *,
+        require_valid_container_id: bool = False,
+    ) -> SandboxInfo | None:
+        try:
+            payload = json.loads(output or "[]")
+        except (json.JSONDecodeError, TypeError):
             return None
-        if not payload:
-            if cached and cached[0] + self.inspect_stale_ttl_sec > now:
-                return cached[1]
+        if (
+            not isinstance(payload, list)
+            or len(payload) != 1
+            or not isinstance(payload[0], dict)
+        ):
             return None
         entry = payload[0]
+        raw_container_id = entry.get("Id")
+        if require_valid_container_id and (
+            not isinstance(raw_container_id, str)
+            or not _DOCKER_CONTAINER_ID.fullmatch(raw_container_id)
+        ):
+            return None
+        raw_image_id = entry.get("Image")
         state = entry.get("State") or {}
         host_config = entry.get("HostConfig") or {}
+        network_settings = entry.get("NetworkSettings") or {}
+        if not isinstance(state, dict):
+            state = {}
+        if not isinstance(host_config, dict):
+            host_config = {}
+        if not isinstance(network_settings, dict):
+            network_settings = {}
+        attached_networks = network_settings.get("Networks") or {}
+        if not isinstance(attached_networks, dict):
+            attached_networks = {}
         status = str(state.get("Status") or "unknown")
         if bool(state.get("Paused")):
             status = "paused"
         pid = state.get("Pid")
-        ports = entry.get("NetworkSettings", {}).get("Ports") or {}
-        networks = entry.get("NetworkSettings", {}).get("Networks") or {}
-        raw_mounts = entry.get("Mounts") or []
-        raw_environment = entry.get("Config", {}).get("Env") or []
-        container_environment = {
-            str(value).split("=", 1)[0]: str(value).split("=", 1)[1]
-            for value in raw_environment
-            if isinstance(value, str) and "=" in value
-        }
-        desktop_auth_values = (
-            container_environment.get("SE_VNC_PASSWORD", ""),
-            container_environment.get("SE_ROUTER_USERNAME", ""),
-            container_environment.get("SE_ROUTER_PASSWORD", ""),
+        ports = network_settings.get("Ports") or {}
+        if not ports or (
+            isinstance(ports, dict)
+            and ports
+            and all(binding in (None, []) for binding in ports.values())
+        ):
+            # Docker Desktop does not materialize published ports for an internal
+            # network. Preserve HostConfig evidence so a legacy container that
+            # requested ports is a parsed policy mismatch (and can be replaced),
+            # not an ambiguous/malformed generation.
+            ports = host_config.get("PortBindings") or {}
+        if not isinstance(ports, dict):
+            ports = {}
+        port_bindings: list[tuple[int, str, int]] = []
+        ports_valid = True
+        for raw_port, raw_bindings in ports.items():
+            if raw_bindings is None:
+                continue
+            match = re.fullmatch(r"([1-9][0-9]*)/tcp", str(raw_port))
+            if not match or not isinstance(raw_bindings, list) or not raw_bindings:
+                ports_valid = False
+                break
+            for binding in raw_bindings:
+                if not isinstance(binding, dict):
+                    ports_valid = False
+                    break
+                host_ip = binding.get("HostIp")
+                host_port = binding.get("HostPort")
+                unassigned_port = host_port == ""
+                if (
+                    not isinstance(host_ip, str)
+                    or not isinstance(host_port, str)
+                    or (
+                        not unassigned_port
+                        and (
+                            not host_port.isdigit()
+                            or not 1 <= int(host_port) <= 65535
+                        )
+                    )
+                ):
+                    ports_valid = False
+                    break
+                port_bindings.append(
+                    (
+                        int(match.group(1)),
+                        host_ip,
+                        0 if unassigned_port else int(host_port),
+                    )
+                )
+            if not ports_valid:
+                break
+        raw_config = entry.get("Config")
+        config = raw_config if isinstance(raw_config, dict) else {}
+        environment_valid, environment = _docker_environment_tuple(
+            config.get("Env")
         )
-        desktop_auth_ready = (
-            container_environment.get("SE_VNC_NO_PASSWORD", "").strip().lower()
-            in {"0", "false", "no", "off"}
-            and all(desktop_auth_values)
+        labels = config.get("Labels") or {} if isinstance(config, dict) else {}
+        if not isinstance(labels, dict):
+            labels = {}
+        raw_mounts = entry.get("Mounts")
+        mounts = raw_mounts if isinstance(raw_mounts, list) else []
+        mounts_valid = isinstance(raw_mounts, list) and all(
+            isinstance(mount, dict)
+            and isinstance(mount.get("Type"), str)
+            and bool(str(mount.get("Type") or ""))
+            and isinstance(mount.get("Source"), str)
+            and bool(str(mount.get("Source") or ""))
+            and isinstance(mount.get("Destination"), str)
+            and bool(str(mount.get("Destination") or ""))
+            and (
+                str(mount.get("Type") or "") != "bind"
+                or (
+                    isinstance(mount.get("RW"), bool)
+                    and isinstance(mount.get("Mode"), str)
+                    and isinstance(mount.get("Propagation"), str)
+                )
+            )
+            for mount in mounts
         )
-        desktop_auth_fingerprint = (
-            self._desktop_auth_fingerprint(*desktop_auth_values)
-            if desktop_auth_ready
-            else None
+        if not isinstance(mounts, list):
+            mounts = []
+        tmpfs = host_config.get("Tmpfs") or {}
+        tmpfs_valid, tmpfs_options = _docker_tmpfs_records(tmpfs)
+        image_reference = config.get("Image")
+        runtime_user = config.get("User")
+        entrypoint_valid, entrypoint = _docker_command_tuple(
+            config.get("Entrypoint")
         )
-        sandbox = SandboxInfo(
-            container_name=container_name,
+        command_valid, command = _docker_command_tuple(config.get("Cmd"))
+        pid_mode = host_config.get("PidMode")
+        ipc_mode = host_config.get("IpcMode")
+        uts_mode = host_config.get("UTSMode")
+        userns_mode = host_config.get("UsernsMode")
+        cgroupns_mode = host_config.get("CgroupnsMode")
+        if require_valid_container_id and (
+            not isinstance(raw_image_id, str)
+            or not _DOCKER_IMAGE_ID.fullmatch(raw_image_id)
+            or not isinstance(raw_config, dict)
+            or "Image" not in config
+            or not isinstance(image_reference, str)
+            or not image_reference.strip()
+            or "User" not in config
+            or not isinstance(runtime_user, str)
+            or "Entrypoint" not in config
+            or not entrypoint_valid
+            or "Cmd" not in config
+            or not command_valid
+            or not isinstance(pid_mode, str)
+            or not isinstance(ipc_mode, str)
+            or not isinstance(uts_mode, str)
+            or not isinstance(userns_mode, str)
+            or not isinstance(cgroupns_mode, str)
+            or not environment_valid
+            or not ports_valid
+            or not mounts_valid
+            or not tmpfs_valid
+        ):
+            return None
+        cap_add: tuple[str, ...] | None = None
+        if "CapAdd" in host_config:
+            raw_cap_add = host_config.get("CapAdd")
+            if raw_cap_add is None:
+                cap_add = ()
+            elif isinstance(raw_cap_add, list):
+                cap_add = tuple(str(capability) for capability in raw_cap_add)
+        return SandboxInfo(
+            container_name=self._container_name(worker_id),
             container_id=str(entry.get("Id") or "").strip() or None,
             state=status,
             workspace_dir=str(self._paths(worker_id)["workspace_dir"]),
@@ -1341,24 +1671,103 @@ class DockerSandboxManager:
                 for option in (host_config.get("SecurityOpt") or [])
                 if option
             ),
-            networks=tuple(sorted(str(name) for name in networks if name)),
-            mounts=tuple(
+            execution_policy=(
+                str(labels.get(PARALLEL_CLEAN_ROOM_POLICY_LABEL) or "")
+                if isinstance(labels, dict)
+                else ""
+            ),
+            image_id=str(raw_image_id or ""),
+            image_reference=str(image_reference or ""),
+            runtime_user=str(runtime_user or ""),
+            entrypoint=entrypoint,
+            command=command,
+            network_mode=str(host_config.get("NetworkMode") or ""),
+            attached_networks=tuple(
+                sorted(str(network) for network in attached_networks)
+            ),
+            pid_mode=pid_mode if isinstance(pid_mode, str) else None,
+            ipc_mode=ipc_mode if isinstance(ipc_mode, str) else None,
+            uts_mode=uts_mode if isinstance(uts_mode, str) else None,
+            userns_mode=userns_mode if isinstance(userns_mode, str) else None,
+            cgroupns_mode=(
+                cgroupns_mode if isinstance(cgroupns_mode, str) else None
+            ),
+            read_only_rootfs=host_config.get("ReadonlyRootfs") is True,
+            privileged=(
+                host_config.get("Privileged")
+                if isinstance(host_config.get("Privileged"), bool)
+                else None
+            ),
+            cap_add=cap_add,
+            cap_drop=tuple(
+                str(capability)
+                for capability in (host_config.get("CapDrop") or [])
+                if capability
+            ),
+            extra_hosts=tuple(
+                str(extra_host)
+                for extra_host in (host_config.get("ExtraHosts") or [])
+                if extra_host
+            ),
+            bind_mount_targets=tuple(
+                sorted(
+                    str(mount.get("Destination") or "")
+                    for mount in mounts
+                    if isinstance(mount, dict)
+                    and str(mount.get("Type") or "") == "bind"
+                    and mount.get("Destination")
+                )
+            ),
+            bind_mount_pairs=tuple(
                 sorted(
                     (
                         str(mount.get("Source") or ""),
                         str(mount.get("Destination") or ""),
                     )
-                    for mount in raw_mounts
+                    for mount in mounts
                     if isinstance(mount, dict)
-                    and str(mount.get("Source") or "")
-                    and str(mount.get("Destination") or "")
+                    and str(mount.get("Type") or "") == "bind"
+                    and mount.get("Source")
+                    and mount.get("Destination")
                 )
             ),
-            desktop_auth_ready=desktop_auth_ready,
-            desktop_auth_fingerprint=desktop_auth_fingerprint,
+            mount_records=tuple(
+                sorted(
+                    (
+                        str(mount.get("Type") or ""),
+                        str(mount.get("Source") or ""),
+                        str(mount.get("Destination") or ""),
+                    )
+                    for mount in mounts
+                    if isinstance(mount, dict)
+                    and mount.get("Type")
+                    and mount.get("Source")
+                    and mount.get("Destination")
+                )
+            ),
+            bind_mount_options=tuple(
+                sorted(
+                    (
+                        str(mount.get("Source") or ""),
+                        str(mount.get("Destination") or ""),
+                        bool(mount.get("RW")),
+                        str(mount.get("Mode") or ""),
+                        str(mount.get("Propagation") or ""),
+                    )
+                    for mount in mounts
+                    if isinstance(mount, dict)
+                    and str(mount.get("Type") or "") == "bind"
+                )
+            ),
+            tmpfs_targets=tuple(
+                sorted(str(target) for target in tmpfs)
+                if isinstance(tmpfs, dict)
+                else ()
+            ),
+            tmpfs_options=tmpfs_options,
+            port_bindings=tuple(sorted(port_bindings)),
+            environment=environment,
         )
-        self._inspect_cache[worker_id] = (now, sandbox)
-        return sandbox
 
     def pause(
         self,
@@ -1494,6 +1903,149 @@ class DockerSandboxManager:
             image=self.image,
             openclaw_port=None,
         )
+
+    def project_parallel_clean_room_run_secrets(
+        self,
+        worker_id: str,
+        *,
+        expected_container_id: str,
+        run_id: str,
+        env: dict[str, str],
+    ) -> dict[str, str]:
+        container_id = str(expected_container_id or "").strip()
+        clean_run_id = str(run_id or "").strip()
+        if not _DOCKER_CONTAINER_ID.fullmatch(container_id):
+            raise RuntimeError(
+                "Parallel clean-room sandbox generation is unavailable for run authority"
+            )
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", clean_run_id):
+            raise RuntimeError("Parallel clean-room run identity is invalid")
+        if set(env) != {"GLASSHIVE_CAPABILITY_BROKER_TOKEN"}:
+            raise RuntimeError("Parallel clean-room run authority scope is invalid")
+        grant = str(env.get("GLASSHIVE_CAPABILITY_BROKER_TOKEN") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,16384}", grant):
+            raise RuntimeError("Parallel clean-room run authority is invalid")
+
+        container_name = self._container_name(worker_id)
+        boundary = self.parallel_clean_room_readiness()
+        if boundary.get("ready") is not True:
+            reason = str(boundary.get("reason") or "unknown_error").strip()
+            raise RuntimeError(
+                "Fresh Parallel clean-room network boundary is unavailable"
+                f": {reason}"
+            )
+        self._ensure_parallel_clean_room_mission_network(container_name)
+        before = self.inspect_fresh(worker_id)
+        sandbox = before.sandbox
+        if (
+            before.status != "present"
+            or sandbox is None
+            or sandbox.state != "running"
+            or str(sandbox.container_id or "").strip() != container_id
+            or not self._sandbox_matches_parallel_clean_room_policy(sandbox)
+        ):
+            raise RuntimeError(
+                "Parallel clean-room sandbox generation changed before run authority projection"
+            )
+
+        secret_root = f"/run/glasshive/{clean_run_id}"
+        prepared = self._docker_exec(
+            container_id,
+            [
+                "bash",
+                "-c",
+                (
+                    "set -e; umask 077; "
+                    f"mkdir -p {shlex.quote(secret_root)}; "
+                    f"chmod 700 {shlex.quote(secret_root)}"
+                ),
+            ],
+            user=self.user,
+        )
+        if prepared.returncode != 0:
+            raise RuntimeError(
+                "Parallel clean-room tmpfs authority directory could not be prepared"
+            )
+
+        env_file = f"{secret_root}/secret-runtime.env"
+        keys_file = f"{secret_root}/secret-runtime.keys"
+        for destination, content in (
+            (
+                env_file,
+                "export GLASSHIVE_CAPABILITY_BROKER_TOKEN="
+                f"{shlex.quote(grant)}\n",
+            ),
+            (keys_file, "GLASSHIVE_CAPABILITY_BROKER_TOKEN\n"),
+        ):
+            written = self._docker_exec(
+                container_id,
+                [
+                    "bash",
+                    "-c",
+                    (
+                        "set -e; umask 077; "
+                        f"cat > {shlex.quote(destination)}; "
+                        f"chmod 600 {shlex.quote(destination)}"
+                    ),
+                ],
+                user=self.user,
+                input_text=content,
+            )
+            if written.returncode != 0:
+                raise RuntimeError(
+                    "Parallel clean-room run authority could not be projected"
+                )
+        after = self.inspect_fresh(worker_id)
+        if (
+            after.status != "present"
+            or after.sandbox is None
+            or str(after.sandbox.container_id or "").strip() != container_id
+            or not self._sandbox_matches_parallel_clean_room_policy(after.sandbox)
+        ):
+            raise RuntimeError(
+                "Parallel clean-room sandbox generation changed during run authority projection"
+            )
+        return {"env_file": env_file, "keys_file": keys_file}
+
+    def clear_parallel_clean_room_run_secrets(
+        self,
+        worker_id: str,
+        *,
+        expected_container_id: str,
+        run_id: str,
+    ) -> None:
+        container_id = str(expected_container_id or "").strip()
+        clean_run_id = str(run_id or "").strip()
+        if not _DOCKER_CONTAINER_ID.fullmatch(container_id) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", clean_run_id
+        ):
+            raise RuntimeError(
+                "Parallel clean-room run authority cleanup identity is invalid"
+            )
+        inspection = self.inspect_fresh(worker_id)
+        sandbox = inspection.sandbox
+        if inspection.status == "confirmed_absent":
+            return
+        if (
+            inspection.status != "present"
+            or sandbox is None
+            or str(sandbox.container_id or "").strip() != container_id
+        ):
+            # Never mutate a replacement generation. The exact old container's
+            # tmpfs disappeared with that generation.
+            return
+        secret_root = f"/run/glasshive/{clean_run_id}"
+        cleared = self._docker_exec(
+            container_id,
+            ["rm", "-rf", "--", secret_root],
+            user=self.user,
+        )
+        if cleared.returncode != 0:
+            detail = str(cleared.stderr or cleared.stdout or "").lower()
+            if "no such container" not in detail and "no such object" not in detail:
+                raise RuntimeError(
+                    "Parallel clean-room run authority cleanup could not be confirmed"
+                )
 
     def exec_command(
         self,
@@ -1709,6 +2261,11 @@ screen -ls | awk -v target="$target" '
             or self.ensure_ready(resolved_worker, runtime_name=runtime_name)
         )
         self._ensure_container_writable_paths(sandbox.container_name, container_paths)
+
+    def harden_worker_host_tree(self, worker_id: str) -> None:
+        """Reassert host-side owner-only modes without following worker links."""
+
+        self._harden_host_worker_tree(self.paths(worker_id)["worker_root"])
 
     def stop_screen_session(
         self,
@@ -3357,6 +3914,27 @@ screen -ls | awk -v target="$target" '
         image_index = len(command) - 1
         command[image_index:image_index] = resource_args
 
+    @staticmethod
+    def _resource_memory_bytes_from_worker(worker: dict) -> int | None:
+        if "resource_class" not in worker and "resource_memory_bytes" not in worker:
+            return None
+        resource_class = normalize_worker_resource_class(
+            worker.get("resource_class") or "standard"
+        )
+        raw_memory = worker.get("resource_memory_bytes")
+        if raw_memory in {None, ""}:
+            memory_bytes = worker_resource_memory_bytes(resource_class)
+        elif isinstance(raw_memory, bool) or int(raw_memory) <= 0:
+            raise ValueError("Worker resource memory must be a positive byte count")
+        else:
+            memory_bytes = int(raw_memory)
+        if (
+            resource_class == "light"
+            and memory_bytes != worker_resource_memory_bytes("light")
+        ):
+            raise ValueError("Light worker memory must use the trusted server value")
+        return memory_bytes
+
     def _docker(
         self,
         args: list[str],
@@ -3411,6 +3989,8 @@ screen -ls | awk -v target="$target" '
             args.append("-i")
         if detach:
             args.append("-d")
+        if input_text is not None:
+            args.append("-i")
         args.extend(["-u", user or self.user])
         if cwd:
             args.extend(["-w", cwd])
@@ -3672,19 +4252,40 @@ screen -ls | awk -v target="$target" '
                 f"find {quoted_paths} -type d -exec setfacl -m {default_acl} {{}} +"
             )
         else:
-            # Single-user local compatibility retains the historical fallback for
-            # bind mounts that do not support POSIX ACLs. Enterprise/multi-user
-            # deployments must never widen worker-private state to world access.
-            script = (
-                "set -e; "
-                f"mkdir -p {quoted_paths}; "
-                "if command -v setfacl >/dev/null 2>&1 "
-                f"&& setfacl -R -m u:{container_user}:rwX,u:{host_uid}:rwX {quoted_paths} 2>/dev/null; then "
-                f"find {quoted_paths} -type d -exec setfacl -m d:u:{container_user}:rwX,d:u:{host_uid}:rwX {{}} + 2>/dev/null || true; "
-                "else "
-                f"chmod -R a+rwX {quoted_paths} 2>/dev/null || true; "
-                "fi"
+            explicit_local_compatibility = (
+                str(os.environ.get("GLASSHIVE_SECURITY_MODE") or "")
+                .strip()
+                .lower()
+                == "local"
             )
+            if explicit_local_compatibility:
+                script = (
+                    "set -e; "
+                    f"mkdir -p {quoted_paths}; "
+                    "if command -v setfacl >/dev/null 2>&1 "
+                    f"&& setfacl -R -m u:{container_user}:rwX,u:{host_uid}:rwX {quoted_paths} 2>/dev/null; then "
+                    f"find {quoted_paths} -type d -exec setfacl -m d:u:{container_user}:rwX,d:u:{host_uid}:rwX {{}} + 2>/dev/null || true; "
+                    "else "
+                    f"chmod -R a+rwX {quoted_paths} 2>/dev/null || true; "
+                    "fi"
+                )
+            else:
+            # A local bind mount still contains worker-private state. Repair
+            # ownership for ordinary entries and keep group/other access closed;
+            # a world-writable fallback would expose that state on Linux hosts.
+                operations: list[str] = ["set -e"]
+                for path in safe_paths:
+                    quoted_path = shlex.quote(path)
+                    operations.extend(
+                        [
+                            f"mkdir -p {quoted_path}",
+                            f"find {quoted_path} -xdev ! -type s ! -type l "
+                            f"! -user {container_user} -exec chown -h {container_user} {{}} +",
+                            f"find {quoted_path} -xdev ! -type s ! -type l "
+                            "-exec chmod u+rwX,go-rwx {} +",
+                        ]
+                    )
+                script = "; ".join(operations)
         result = self._docker_exec(
             container_name,
             ["bash", "-c", script],
@@ -5322,581 +5923,11 @@ screen -ls | awk -v target="$target" '
                 return size_mib * 1024**2
         return None
 
-    def inspect_fresh(
-        self,
-        worker_id: str,
-        *,
-        require_configured_image: bool = True,
-    ) -> FreshSandboxInspection:
-        """Probe Docker directly for clean-room secret admission authority."""
-        container_name = self._container_name(worker_id)
-        try:
-            result = self._docker(
-                ["inspect", container_name],
-                check=False,
-                capture_output=True,
-                timeout_sec=self.inspect_timeout_sec,
-            )
-        except (OSError, RuntimeError, subprocess.SubprocessError):
-            return FreshSandboxInspection(
-                status="unavailable",
-                reason="docker_inspect_failed",
-            )
-        if result.returncode != 0:
-            detail = str(result.stderr or result.stdout or "").lower()
-            if result.returncode == 1 and (
-                "no such object" in detail or "no such container" in detail
-            ):
-                if require_configured_image:
-                    configured_image, image_reason = (
-                        self._inspect_configured_image_fresh()
-                    )
-                    if configured_image is None:
-                        return FreshSandboxInspection(
-                            status="unavailable",
-                            reason=image_reason,
-                        )
-                self._invalidate_inspect_cache(worker_id)
-                return FreshSandboxInspection(
-                    status="confirmed_absent",
-                    reason="docker_confirmed_container_absent",
-                )
-            return FreshSandboxInspection(
-                status="unavailable",
-                reason=(
-                    "docker_inspect_timeout"
-                    if result.returncode == 124
-                    else "docker_inspect_failed"
-                ),
-            )
-        sandbox = self._sandbox_from_inspect_output(
-            worker_id,
-            result.stdout,
-            require_valid_container_id=True,
-        )
-        if sandbox is None:
-            return FreshSandboxInspection(
-                status="unavailable",
-                reason="docker_inspect_malformed",
-            )
-        if not require_configured_image:
-            self._inspect_cache[worker_id] = (time.monotonic(), sandbox)
-            return FreshSandboxInspection(status="present", sandbox=sandbox)
-        configured_image, image_reason = self._inspect_configured_image_fresh()
-        if configured_image is None:
-            return FreshSandboxInspection(
-                status="unavailable",
-                reason=image_reason,
-            )
-        sandbox.expected_image_id = configured_image.image_id
-        sandbox.expected_runtime_user = configured_image.runtime_user
-        sandbox.expected_entrypoint = configured_image.entrypoint
-        sandbox.expected_command = configured_image.command
-        sandbox.expected_environment = configured_image.environment
-        self._inspect_cache[worker_id] = (time.monotonic(), sandbox)
-        return FreshSandboxInspection(status="present", sandbox=sandbox)
 
-    def _inspect_configured_image_fresh(
-        self,
-    ) -> tuple[ConfiguredSandboxImage | None, str]:
-        try:
-            result = self._docker(
-                ["image", "inspect", self.image],
-                check=False,
-                capture_output=True,
-                timeout_sec=self.image_inspect_timeout_sec,
-            )
-        except (OSError, RuntimeError, subprocess.SubprocessError):
-            return None, "docker_image_inspect_failed"
-        if result.returncode != 0:
-            return (
-                None,
-                "docker_image_inspect_timeout"
-                if result.returncode == 124
-                else "docker_image_inspect_failed",
-            )
-        try:
-            payload = json.loads(result.stdout or "[]")
-        except (json.JSONDecodeError, TypeError):
-            return None, "docker_image_inspect_malformed"
-        if (
-            not isinstance(payload, list)
-            or len(payload) != 1
-            or not isinstance(payload[0], dict)
-        ):
-            return None, "docker_image_inspect_malformed"
-        entry = payload[0]
-        image_id = entry.get("Id")
-        config = entry.get("Config")
-        if (
-            not isinstance(image_id, str)
-            or not _DOCKER_IMAGE_ID.fullmatch(image_id)
-            or not isinstance(config, dict)
-            or "User" not in config
-            or "Cmd" not in config
-            or "Env" not in config
-        ):
-            return None, "docker_image_inspect_malformed"
-        runtime_user = config.get("User")
-        entrypoint_valid, entrypoint = _docker_command_tuple(
-            config.get("Entrypoint")
-        )
-        command_valid, command = _docker_command_tuple(config.get("Cmd"))
-        environment_valid, environment = _docker_environment_tuple(
-            config.get("Env")
-        )
-        if (
-            not isinstance(runtime_user, str)
-            or not entrypoint_valid
-            or not command_valid
-            or not environment_valid
-        ):
-            return None, "docker_image_inspect_malformed"
-        if (
-            self.user != "seluser"
-            or runtime_user != self.user
-            or _docker_user_is_root(runtime_user)
-            or _docker_user_is_root(self.user)
-        ):
-            return None, "configured_image_user_policy_mismatch"
-        return (
-            ConfiguredSandboxImage(
-                image_id=image_id,
-                runtime_user=runtime_user,
-                entrypoint=entrypoint,
-                command=command,
-                environment=environment,
-            ),
-            "",
-        )
 
-    def _sandbox_from_inspect_output(
-        self,
-        worker_id: str,
-        output: str | None,
-        *,
-        require_valid_container_id: bool = False,
-    ) -> SandboxInfo | None:
-        try:
-            payload = json.loads(output or "[]")
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if (
-            not isinstance(payload, list)
-            or len(payload) != 1
-            or not isinstance(payload[0], dict)
-        ):
-            return None
-        entry = payload[0]
-        raw_container_id = entry.get("Id")
-        if require_valid_container_id and (
-            not isinstance(raw_container_id, str)
-            or not _DOCKER_CONTAINER_ID.fullmatch(raw_container_id)
-        ):
-            return None
-        raw_image_id = entry.get("Image")
-        state = entry.get("State") or {}
-        host_config = entry.get("HostConfig") or {}
-        network_settings = entry.get("NetworkSettings") or {}
-        if not isinstance(state, dict):
-            state = {}
-        if not isinstance(host_config, dict):
-            host_config = {}
-        if not isinstance(network_settings, dict):
-            network_settings = {}
-        attached_networks = network_settings.get("Networks") or {}
-        if not isinstance(attached_networks, dict):
-            attached_networks = {}
-        status = str(state.get("Status") or "unknown")
-        if bool(state.get("Paused")):
-            status = "paused"
-        pid = state.get("Pid")
-        ports = network_settings.get("Ports") or {}
-        if not ports or (
-            isinstance(ports, dict)
-            and ports
-            and all(binding in (None, []) for binding in ports.values())
-        ):
-            # Docker Desktop does not materialize published ports for an internal
-            # network. Preserve HostConfig evidence so a legacy container that
-            # requested ports is a parsed policy mismatch (and can be replaced),
-            # not an ambiguous/malformed generation.
-            ports = host_config.get("PortBindings") or {}
-        if not isinstance(ports, dict):
-            ports = {}
-        port_bindings: list[tuple[int, str, int]] = []
-        ports_valid = True
-        for raw_port, raw_bindings in ports.items():
-            if raw_bindings is None:
-                continue
-            match = re.fullmatch(r"([1-9][0-9]*)/tcp", str(raw_port))
-            if not match or not isinstance(raw_bindings, list) or not raw_bindings:
-                ports_valid = False
-                break
-            for binding in raw_bindings:
-                if not isinstance(binding, dict):
-                    ports_valid = False
-                    break
-                host_ip = binding.get("HostIp")
-                host_port = binding.get("HostPort")
-                unassigned_port = host_port == ""
-                if (
-                    not isinstance(host_ip, str)
-                    or not isinstance(host_port, str)
-                    or (
-                        not unassigned_port
-                        and (
-                            not host_port.isdigit()
-                            or not 1 <= int(host_port) <= 65535
-                        )
-                    )
-                ):
-                    ports_valid = False
-                    break
-                port_bindings.append(
-                    (
-                        int(match.group(1)),
-                        host_ip,
-                        0 if unassigned_port else int(host_port),
-                    )
-                )
-            if not ports_valid:
-                break
-        raw_config = entry.get("Config")
-        config = raw_config if isinstance(raw_config, dict) else {}
-        environment_valid, environment = _docker_environment_tuple(
-            config.get("Env")
-        )
-        labels = config.get("Labels") or {} if isinstance(config, dict) else {}
-        if not isinstance(labels, dict):
-            labels = {}
-        raw_mounts = entry.get("Mounts")
-        mounts = raw_mounts if isinstance(raw_mounts, list) else []
-        mounts_valid = isinstance(raw_mounts, list) and all(
-            isinstance(mount, dict)
-            and isinstance(mount.get("Type"), str)
-            and bool(str(mount.get("Type") or ""))
-            and isinstance(mount.get("Source"), str)
-            and bool(str(mount.get("Source") or ""))
-            and isinstance(mount.get("Destination"), str)
-            and bool(str(mount.get("Destination") or ""))
-            and (
-                str(mount.get("Type") or "") != "bind"
-                or (
-                    isinstance(mount.get("RW"), bool)
-                    and isinstance(mount.get("Mode"), str)
-                    and isinstance(mount.get("Propagation"), str)
-                )
-            )
-            for mount in mounts
-        )
-        if not isinstance(mounts, list):
-            mounts = []
-        tmpfs = host_config.get("Tmpfs") or {}
-        tmpfs_valid, tmpfs_options = _docker_tmpfs_records(tmpfs)
-        image_reference = config.get("Image")
-        runtime_user = config.get("User")
-        entrypoint_valid, entrypoint = _docker_command_tuple(
-            config.get("Entrypoint")
-        )
-        command_valid, command = _docker_command_tuple(config.get("Cmd"))
-        pid_mode = host_config.get("PidMode")
-        ipc_mode = host_config.get("IpcMode")
-        uts_mode = host_config.get("UTSMode")
-        userns_mode = host_config.get("UsernsMode")
-        cgroupns_mode = host_config.get("CgroupnsMode")
-        if require_valid_container_id and (
-            not isinstance(raw_image_id, str)
-            or not _DOCKER_IMAGE_ID.fullmatch(raw_image_id)
-            or not isinstance(raw_config, dict)
-            or "Image" not in config
-            or not isinstance(image_reference, str)
-            or not image_reference.strip()
-            or "User" not in config
-            or not isinstance(runtime_user, str)
-            or "Entrypoint" not in config
-            or not entrypoint_valid
-            or "Cmd" not in config
-            or not command_valid
-            or not isinstance(pid_mode, str)
-            or not isinstance(ipc_mode, str)
-            or not isinstance(uts_mode, str)
-            or not isinstance(userns_mode, str)
-            or not isinstance(cgroupns_mode, str)
-            or not environment_valid
-            or not ports_valid
-            or not mounts_valid
-            or not tmpfs_valid
-        ):
-            return None
-        cap_add: tuple[str, ...] | None = None
-        if "CapAdd" in host_config:
-            raw_cap_add = host_config.get("CapAdd")
-            if raw_cap_add is None:
-                cap_add = ()
-            elif isinstance(raw_cap_add, list):
-                cap_add = tuple(str(capability) for capability in raw_cap_add)
-        return SandboxInfo(
-            container_name=self._container_name(worker_id),
-            container_id=str(entry.get("Id") or "").strip() or None,
-            state=status,
-            workspace_dir=str(self._paths(worker_id)["workspace_dir"]),
-            home_dir=str(self._paths(worker_id)["home_dir"]),
-            pid=int(pid) if isinstance(pid, int) and pid > 0 and status == "running" else None,
-            image=self.image,
-            novnc_port=self._host_port_for(ports, self.novnc_container_port),
-            selenium_port=self._host_port_for(ports, self.selenium_container_port),
-            openclaw_port=self._host_port_for(ports, self.openclaw_container_port),
-            security_options=tuple(
-                str(option)
-                for option in (host_config.get("SecurityOpt") or [])
-                if option
-            ),
-            execution_policy=(
-                str(labels.get(PARALLEL_CLEAN_ROOM_POLICY_LABEL) or "")
-                if isinstance(labels, dict)
-                else ""
-            ),
-            image_id=str(raw_image_id or ""),
-            image_reference=str(image_reference or ""),
-            runtime_user=str(runtime_user or ""),
-            entrypoint=entrypoint,
-            command=command,
-            network_mode=str(host_config.get("NetworkMode") or ""),
-            attached_networks=tuple(
-                sorted(str(network) for network in attached_networks)
-            ),
-            pid_mode=pid_mode if isinstance(pid_mode, str) else None,
-            ipc_mode=ipc_mode if isinstance(ipc_mode, str) else None,
-            uts_mode=uts_mode if isinstance(uts_mode, str) else None,
-            userns_mode=userns_mode if isinstance(userns_mode, str) else None,
-            cgroupns_mode=(
-                cgroupns_mode if isinstance(cgroupns_mode, str) else None
-            ),
-            read_only_rootfs=host_config.get("ReadonlyRootfs") is True,
-            privileged=(
-                host_config.get("Privileged")
-                if isinstance(host_config.get("Privileged"), bool)
-                else None
-            ),
-            cap_add=cap_add,
-            cap_drop=tuple(
-                str(capability)
-                for capability in (host_config.get("CapDrop") or [])
-                if capability
-            ),
-            extra_hosts=tuple(
-                str(extra_host)
-                for extra_host in (host_config.get("ExtraHosts") or [])
-                if extra_host
-            ),
-            bind_mount_targets=tuple(
-                sorted(
-                    str(mount.get("Destination") or "")
-                    for mount in mounts
-                    if isinstance(mount, dict)
-                    and str(mount.get("Type") or "") == "bind"
-                    and mount.get("Destination")
-                )
-            ),
-            bind_mount_pairs=tuple(
-                sorted(
-                    (
-                        str(mount.get("Source") or ""),
-                        str(mount.get("Destination") or ""),
-                    )
-                    for mount in mounts
-                    if isinstance(mount, dict)
-                    and str(mount.get("Type") or "") == "bind"
-                    and mount.get("Source")
-                    and mount.get("Destination")
-                )
-            ),
-            mount_records=tuple(
-                sorted(
-                    (
-                        str(mount.get("Type") or ""),
-                        str(mount.get("Source") or ""),
-                        str(mount.get("Destination") or ""),
-                    )
-                    for mount in mounts
-                    if isinstance(mount, dict)
-                    and mount.get("Type")
-                    and mount.get("Source")
-                    and mount.get("Destination")
-                )
-            ),
-            bind_mount_options=tuple(
-                sorted(
-                    (
-                        str(mount.get("Source") or ""),
-                        str(mount.get("Destination") or ""),
-                        bool(mount.get("RW")),
-                        str(mount.get("Mode") or ""),
-                        str(mount.get("Propagation") or ""),
-                    )
-                    for mount in mounts
-                    if isinstance(mount, dict)
-                    and str(mount.get("Type") or "") == "bind"
-                )
-            ),
-            tmpfs_targets=tuple(
-                sorted(str(target) for target in tmpfs)
-                if isinstance(tmpfs, dict)
-                else ()
-            ),
-            tmpfs_options=tmpfs_options,
-            port_bindings=tuple(sorted(port_bindings)),
-            environment=environment,
-        )
 
-    def project_parallel_clean_room_run_secrets(
-        self,
-        worker_id: str,
-        *,
-        expected_container_id: str,
-        run_id: str,
-        env: dict[str, str],
-    ) -> dict[str, str]:
-        container_id = str(expected_container_id or "").strip()
-        clean_run_id = str(run_id or "").strip()
-        if not _DOCKER_CONTAINER_ID.fullmatch(container_id):
-            raise RuntimeError(
-                "Parallel clean-room sandbox generation is unavailable for run authority"
-            )
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", clean_run_id):
-            raise RuntimeError("Parallel clean-room run identity is invalid")
-        if set(env) != {"GLASSHIVE_CAPABILITY_BROKER_TOKEN"}:
-            raise RuntimeError("Parallel clean-room run authority scope is invalid")
-        grant = str(env.get("GLASSHIVE_CAPABILITY_BROKER_TOKEN") or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9_-]{16,16384}", grant):
-            raise RuntimeError("Parallel clean-room run authority is invalid")
 
-        container_name = self._container_name(worker_id)
-        boundary = self.parallel_clean_room_readiness()
-        if boundary.get("ready") is not True:
-            reason = str(boundary.get("reason") or "unknown_error").strip()
-            raise RuntimeError(
-                "Fresh Parallel clean-room network boundary is unavailable"
-                f": {reason}"
-            )
-        self._ensure_parallel_clean_room_mission_network(container_name)
-        before = self.inspect_fresh(worker_id)
-        sandbox = before.sandbox
-        if (
-            before.status != "present"
-            or sandbox is None
-            or sandbox.state != "running"
-            or str(sandbox.container_id or "").strip() != container_id
-            or not self._sandbox_matches_parallel_clean_room_policy(sandbox)
-        ):
-            raise RuntimeError(
-                "Parallel clean-room sandbox generation changed before run authority projection"
-            )
 
-        secret_root = f"/run/glasshive/{clean_run_id}"
-        prepared = self._docker_exec(
-            container_id,
-            [
-                "bash",
-                "-c",
-                (
-                    "set -e; umask 077; "
-                    f"mkdir -p {shlex.quote(secret_root)}; "
-                    f"chmod 700 {shlex.quote(secret_root)}"
-                ),
-            ],
-            user=self.user,
-        )
-        if prepared.returncode != 0:
-            raise RuntimeError(
-                "Parallel clean-room tmpfs authority directory could not be prepared"
-            )
-
-        env_file = f"{secret_root}/secret-runtime.env"
-        keys_file = f"{secret_root}/secret-runtime.keys"
-        for destination, content in (
-            (
-                env_file,
-                "export GLASSHIVE_CAPABILITY_BROKER_TOKEN="
-                f"{shlex.quote(grant)}\n",
-            ),
-            (keys_file, "GLASSHIVE_CAPABILITY_BROKER_TOKEN\n"),
-        ):
-            written = self._docker_exec(
-                container_id,
-                [
-                    "bash",
-                    "-c",
-                    (
-                        "set -e; umask 077; "
-                        f"cat > {shlex.quote(destination)}; "
-                        f"chmod 600 {shlex.quote(destination)}"
-                    ),
-                ],
-                user=self.user,
-                input_text=content,
-            )
-            if written.returncode != 0:
-                raise RuntimeError(
-                    "Parallel clean-room run authority could not be projected"
-                )
-        after = self.inspect_fresh(worker_id)
-        if (
-            after.status != "present"
-            or after.sandbox is None
-            or str(after.sandbox.container_id or "").strip() != container_id
-            or not self._sandbox_matches_parallel_clean_room_policy(after.sandbox)
-        ):
-            raise RuntimeError(
-                "Parallel clean-room sandbox generation changed during run authority projection"
-            )
-        return {"env_file": env_file, "keys_file": keys_file}
-
-    def clear_parallel_clean_room_run_secrets(
-        self,
-        worker_id: str,
-        *,
-        expected_container_id: str,
-        run_id: str,
-    ) -> None:
-        container_id = str(expected_container_id or "").strip()
-        clean_run_id = str(run_id or "").strip()
-        if not _DOCKER_CONTAINER_ID.fullmatch(container_id) or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", clean_run_id
-        ):
-            raise RuntimeError(
-                "Parallel clean-room run authority cleanup identity is invalid"
-            )
-        inspection = self.inspect_fresh(worker_id)
-        sandbox = inspection.sandbox
-        if inspection.status == "confirmed_absent":
-            return
-        if (
-            inspection.status != "present"
-            or sandbox is None
-            or str(sandbox.container_id or "").strip() != container_id
-        ):
-            # Never mutate a replacement generation. The exact old container's
-            # tmpfs disappeared with that generation.
-            return
-        secret_root = f"/run/glasshive/{clean_run_id}"
-        cleared = self._docker_exec(
-            container_id,
-            ["rm", "-rf", "--", secret_root],
-            user=self.user,
-        )
-        if cleared.returncode != 0:
-            detail = str(cleared.stderr or cleared.stdout or "").lower()
-            if "no such container" not in detail and "no such object" not in detail:
-                raise RuntimeError(
-                    "Parallel clean-room run authority cleanup could not be confirmed"
-                )
-
-    def harden_worker_host_tree(self, worker_id: str) -> None:
-        """Reassert host-side owner-only modes without following worker links."""
-
-        self._harden_host_worker_tree(self.paths(worker_id)["worker_root"])
 
     def _sandbox_matches_parallel_clean_room_policy(
         self, sandbox: SandboxInfo
@@ -6167,26 +6198,6 @@ screen -ls | awk -v target="$target" '
         finally:
             os.close(descriptor)
 
-    @staticmethod
-    def _resource_memory_bytes_from_worker(worker: dict) -> int | None:
-        if "resource_class" not in worker and "resource_memory_bytes" not in worker:
-            return None
-        resource_class = normalize_worker_resource_class(
-            worker.get("resource_class") or "standard"
-        )
-        raw_memory = worker.get("resource_memory_bytes")
-        if raw_memory in {None, ""}:
-            memory_bytes = worker_resource_memory_bytes(resource_class)
-        elif isinstance(raw_memory, bool) or int(raw_memory) <= 0:
-            raise ValueError("Worker resource memory must be a positive byte count")
-        else:
-            memory_bytes = int(raw_memory)
-        if (
-            resource_class == "light"
-            and memory_bytes != worker_resource_memory_bytes("light")
-        ):
-            raise ValueError("Light worker memory must use the trusted server value")
-        return memory_bytes
 
     @classmethod
     def _harden_host_worker_tree(cls, worker_root: Path) -> None:

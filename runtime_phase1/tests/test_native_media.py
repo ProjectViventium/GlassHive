@@ -199,6 +199,12 @@ def test_actual_command_builder_selects_native_image_transport(tmp_path, monkeyp
     runtime_class = profile_runtime.HostCodexCliRuntime if harness == "codex" else profile_runtime.HostClaudeCodeRuntime
     runtime = runtime_class(base_dir=str(tmp_path / "state"))
     monkeypatch.setattr(runtime, "_host_env", lambda *_: {})
+    if harness == "claude":
+        monkeypatch.setattr(
+            runtime,
+            "_inject_private_subscription_auth",
+            lambda _env: "synthetic_test",
+        )
     monkeypatch.setattr(profile_runtime, "apply_bound_provider_account_environment", lambda *_args, **_kwargs: None)
     monkeypatch.setenv("WPR_HOST_CODEX_CONVERSATION_PROJECT_INSTRUCTIONS", "inherit")
     monkeypatch.setenv("WPR_CLAUDE_CODE_ENABLE_CHROME", "0")

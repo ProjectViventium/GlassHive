@@ -529,12 +529,12 @@ def test_models_expose_exact_harness_registry(tmp_path, monkeypatch):
     assert models["claude-code:opus"]["display_name"] == "Claude / Opus"
     assert models["claude-code:opus"]["recommended_effort"] == "max"
     assert models["claude-code:opus"]["effort_choices"] == [
-        "default",
         "low",
         "medium",
         "high",
         "xhigh",
         "max",
+        "default",
     ]
     assert all(model["capabilities"]["activity_stream"] for model in models.values())
     assert all(model["capabilities"]["conversation_session"] for model in models.values())

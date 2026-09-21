@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from workers_projects_runtime.agent_builder_control import (
@@ -308,12 +309,24 @@ def test_non_streaming_graph_choice_returns_one_openai_tool_call(monkeypatch):
     class RecordingStore:
         response_json = ""
 
-        def update_provider_request(self, request_id: str, **fields):
+        def get_provider_request(self, request_id: str):
+            assert request_id == "request-example"
+            return None
+
+        def commit_provider_request_terminal(self, request_id: str, **fields):
             assert request_id == "request-example"
             self.response_json = fields["response_json"]
+            return {"state": "completed", "response_json": self.response_json}
+
+        def get_provider_session_by_id(self, _session_id: str):
+            return None
+
+        def get_worker(self, _worker_id: str):
+            return None
 
     provider = ConversationProvider.__new__(ConversationProvider)
     provider.store = RecordingStore()
+    provider.service = SimpleNamespace(runtime=SimpleNamespace())
     payload = _payload()
     monkeypatch.setattr(
         provider,
@@ -336,8 +349,8 @@ def test_non_streaming_graph_choice_returns_one_openai_tool_call(monkeypatch):
     )
 
     response = provider.response_payload(
-        {"request_id": "request-example", "state": "completed", "response_json": ""},
-        {"state": "completed"},
+        {"request_id": "request-example", "state": "completed", "response_json": "", "session_id": "session-example"},
+        {"state": "completed", "run_id": "run-example"},
         payload,
     )
 

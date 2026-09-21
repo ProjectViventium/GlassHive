@@ -545,6 +545,12 @@ class _CaptureStore:
             return None
         return self.run
 
+    def get_provider_request(self, _request_id):
+        return None
+
+    def get_provider_session_by_id(self, _session_id):
+        return None
+
     def get_delegation_for_worker(self, *_args, **_kwargs):
         return None
 
@@ -557,6 +563,12 @@ class _CaptureStore:
 
     def update_provider_request(self, *_args, **_kwargs):
         return None
+
+    def commit_provider_request_terminal(
+        self, _request_id, *, expected_run_id, state, response_json="", **_kwargs
+    ):
+        assert expected_run_id == "run-synthetic"
+        return {"state": state, "response_json": response_json}
 
     def scheduling_cortex_occurrence_for_run(self, _run_id):
         return None
@@ -632,11 +644,13 @@ def _candidate_callback_payload() -> tuple[dict[str, Any], WorkersProjectsServic
 def _candidate_chat_completion() -> dict[str, Any]:
     provider = ConversationProvider.__new__(ConversationProvider)
     provider.store = _CaptureStore()
+    provider.service = SimpleNamespace(runtime=SimpleNamespace())
     provider._conversation_output = lambda _request_record, _run: "Synthetic answer."
-    provider._completion_usage = lambda _request_record, _run, _payload, _output: (
-        {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
-        "native",
-    )
+    provider._native_usage_snapshot = lambda _request_record, _run: {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+    }
     request = ChatCompletionRequest(
         model="codex-cli:gpt-5.6-sol",
         messages=[{"role": "user", "content": "Synthetic question"}],
@@ -644,10 +658,11 @@ def _candidate_chat_completion() -> dict[str, Any]:
     response = provider.response_payload(
         {
             "request_id": "chatcmpl-gh-synthetic",
+            "session_id": "session-synthetic",
             "state": "completed",
             "response_json": "",
         },
-        {},
+        {"run_id": "run-synthetic"},
         request,
     )
     response["created"] = "<timestamp>"
@@ -688,7 +703,9 @@ async def _candidate_chat_stream() -> list[dict[str, Any] | str]:
             return {
                 "request_id": request_id,
                 "run_id": "run-1",
+                "session_id": "session-synthetic",
                 "state": "completed",
+                "response_json": "",
             }
 
         def get_run(self, _run_id):
@@ -697,15 +714,26 @@ async def _candidate_chat_stream() -> list[dict[str, Any] | str]:
         def list_provider_activity(self, _request_id):
             return []
 
+        def get_provider_session_by_id(self, _session_id):
+            return None
+
+        def commit_provider_request_terminal(
+            self, _request_id, *, expected_run_id, state, response_json="", **_kwargs
+        ):
+            assert expected_run_id == "run-1"
+            return {"state": state, "response_json": response_json}
+
     provider = ConversationProvider.__new__(ConversationProvider)
     provider.store = TerminalStore()
+    provider.service = SimpleNamespace(runtime=SimpleNamespace())
     provider._sync = lambda record: record
     provider._native_output_snapshot = lambda _record, _run: ""
     provider._conversation_output = lambda _record, _run: "Synthetic answer."
-    provider._completion_usage = lambda _record, _run, _payload, _output: (
-        {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
-        "native",
-    )
+    provider._native_usage_snapshot = lambda _record, _run: {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+    }
     request = ChatCompletionRequest(
         model="codex-cli:gpt-5.6-sol",
         messages=[{"role": "user", "content": "Synthetic question"}],

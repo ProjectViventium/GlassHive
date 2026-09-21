@@ -171,7 +171,7 @@ def sign_link_params(
     expires_at: int | None = None,
 ) -> dict[str, str]:
     secret = signed_link_secret()
-    if not secret:
+    if not secret or worker_signed_links_blocked(worker_id):
         return {}
     if expires_at is not None:
         resolved_expires_at = int(expires_at)
@@ -369,6 +369,14 @@ def _link_ref_conn() -> Iterator[sqlite3.Connection]:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signed_link_worker_revocations (
+                worker_id TEXT PRIMARY KEY,
+                revoked_at INTEGER NOT NULL
+            )
+            """
+        )
         columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(signed_link_refs)").fetchall()}
         if "payload_json" not in columns:
             conn.execute("ALTER TABLE signed_link_refs ADD COLUMN payload_json TEXT NOT NULL DEFAULT ''")
@@ -510,6 +518,14 @@ def revoke_signed_link_refs_for_worker(worker_id: str) -> int:
     worker_value = json.dumps(clean_worker_id, separators=(",", ":"))
     pattern = f'%"worker_id":{worker_value}%'
     with _link_ref_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO signed_link_worker_revocations (
+                worker_id, revoked_at
+            ) VALUES (?, ?)
+            """,
+            (clean_worker_id, int(time.time())),
+        )
         cursor = conn.execute("DELETE FROM signed_link_refs WHERE scope_key LIKE ?", (pattern,))
         return int(cursor.rowcount or 0)
 
@@ -530,6 +546,10 @@ def resolve_signed_link_ref(ref_id: str) -> dict[str, object] | None:
     token = str(row["token"] or "")
     verified_payload = _decode_signed_link_token(token, allow_expired=True)
     if not verified_payload:
+        return None
+    if worker_signed_links_blocked(
+        str(verified_payload.get("worker_id") or "")
+    ):
         return None
     return {
         "ref_id": clean_ref,
@@ -560,7 +580,11 @@ def verify_signed_link(
     signature: str,
 ) -> bool:
     secret = signed_link_secret()
-    if not secret or not signature:
+    if (
+        not secret
+        or not signature
+        or worker_signed_links_blocked(worker_id)
+    ):
         return False
     try:
         exp_int = int(str(expires_at or ""))
@@ -599,7 +623,7 @@ def sign_link_token(
     ttl_seconds: int | None = None,
 ) -> str:
     secret = signed_link_secret()
-    if not secret:
+    if not secret or worker_signed_links_blocked(worker_id):
         return ""
     ttl = signed_link_ttl_for_kind(kind, ttl_seconds)
     payload = {
@@ -642,4 +666,9 @@ def _decode_signed_link_token(token: str, *, allow_expired: bool = False) -> dic
 
 
 def verify_signed_link_token(token: str) -> dict[str, object] | None:
-    return _decode_signed_link_token(token, allow_expired=False)
+    payload = _decode_signed_link_token(token, allow_expired=False)
+    if payload and worker_signed_links_blocked(
+        str(payload.get("worker_id") or "")
+    ):
+        return None
+    return payload
