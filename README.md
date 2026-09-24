@@ -1,6 +1,8 @@
 <!-- VIVENTIUM START: Glass Hive root README -->
 # Glass Hive
 
+**Legacy project:** Glass Hive has moved to [xPerfect](https://github.com/xPerfectAI/xPerfect).
+
 **Persistent workers. Resumable sandboxes. Live takeover.**
 
 Glass Hive is a standalone workstation-sandbox runtime in the Viventium ecosystem.
